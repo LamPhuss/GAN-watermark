@@ -1,7 +1,7 @@
 # ============================================================
 # data_generator.py  (standalone — zero MarkLLM dependency)
-# Description: Generate training data using UPV watermark
-#   loaded from the local upv/ package (no MarkLLM import).
+# Description: Generate training data using UPV watermark.
+#   + Flash Attention 2 for faster LLM inference.
 # ============================================================
 
 import os
@@ -11,17 +11,33 @@ from typing import List, Tuple, Optional
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# ← Local package: no external repo needed
 from upv.upv import UPV
 from upv.transformers_config import TransformersConfig
+
+
+def _load_model_with_flash_attn(model_name: str, device: str) -> AutoModelForCausalLM:
+    """
+    Load HuggingFace causal LM with Flash Attention 2 if available.
+    Falls back to default attention if flash_attn not installed.
+    """
+    load_kwargs = {
+        "torch_dtype": torch.float16 if "cuda" in device else torch.float32,
+    }
+    try:
+        import flash_attn  # noqa: F401
+        load_kwargs["attn_implementation"] = "flash_attention_2"
+        print(f"[FlashAttn] Oracle: using flash_attention_2")
+    except ImportError:
+        print(f"[FlashAttn] Oracle: flash_attn not found, using default")
+
+    return AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
 
 
 class UPVOracle:
     """
     UPV Generator (Oracle / Ground Truth).
-
-    Wraps the local UPV watermark.  Weights are FROZEN — it only
-    generates real watermarked text used as the GAN's "real" signal.
+    Weights are FROZEN — only generates real watermarked text.
+    Uses Flash Attention 2 for faster generation.
     """
 
     def __init__(
@@ -36,7 +52,8 @@ class UPVOracle:
         self.device = device
 
         print(f"[UPVOracle] Loading LLM: {model_name}")
-        self.model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+        self.model = _load_model_with_flash_attn(model_name, device)
+        self.model.to(device)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
         if self.tokenizer.pad_token is None:
@@ -47,13 +64,11 @@ class UPVOracle:
         for param in self.model.parameters():
             param.requires_grad = False
 
-        # Build TransformersConfig (local, no MarkLLM)
         transformers_config = TransformersConfig(
             model=self.model,
             tokenizer=self.tokenizer,
             vocab_size=self.model.config.vocab_size,
             device=device,
-            # Generation kwargs forwarded to model.generate()
             max_new_tokens=max_new_tokens,
             do_sample=do_sample,
             no_repeat_ngram_size=no_repeat_ngram_size,
@@ -68,16 +83,10 @@ class UPVOracle:
 
         print("[UPVOracle] Ready. All weights FROZEN.")
 
-    # ── public API ──
-
     @torch.no_grad()
     def generate_watermarked(
         self, prompts: List[str], max_new_tokens: int = 256
     ) -> Tuple[List[str], List[torch.Tensor]]:
-        """
-        Generate watermarked text (label=1 for Discriminator).
-        Returns (texts, token_ids_list).
-        """
         texts, ids_list = [], []
         for prompt in prompts:
             try:
@@ -97,10 +106,6 @@ class UPVOracle:
     def generate_unwatermarked(
         self, prompts: List[str], max_new_tokens: int = 256
     ) -> Tuple[List[str], List[torch.Tensor]]:
-        """
-        Generate natural (no-watermark) text (label=0 for Discriminator).
-        Returns (texts, token_ids_list).
-        """
         texts, ids_list = [], []
         for prompt in prompts:
             try:
@@ -117,18 +122,12 @@ class UPVOracle:
         return texts, ids_list
 
     def detect_watermark(self, text: str) -> dict:
-        """Run UPV detection on a text string."""
         return self.watermark.detect_watermark(text)
 
-
-# ──────────────────────────────────────────────────────────────
-# DataGenerator
-# ──────────────────────────────────────────────────────────────
 
 class DataGenerator:
     """Generate pre-training datasets for Discriminator and Attacker."""
 
-    # Fallback prompts when the dataset file is missing
     _FALLBACK_PROMPTS = [
         "The latest research in artificial intelligence suggests that",
         "In a groundbreaking study, scientists discovered that",
@@ -138,10 +137,10 @@ class DataGenerator:
         "Historians have long debated the true causes of",
         "New regulations aimed at reducing carbon emissions will",
         "The relationship between diet and mental health is",
-    ] * 200  # 1 600 dummy prompts
+    ] * 200
 
     def __init__(self, oracle: UPVOracle, dataset_path: str):
-        self.oracle  = oracle
+        self.oracle = oracle
         self.prompts = self._load_prompts(dataset_path)
 
     def _load_prompts(self, path: str) -> List[str]:
@@ -154,22 +153,14 @@ class DataGenerator:
                         prompts.append(item["prompt"])
             print(f"[DataGenerator] Loaded {len(prompts)} prompts from {path}")
         except FileNotFoundError:
-            print(f"[DataGenerator] Dataset not found at '{path}'. Using fallback prompts.")
+            print(f"[DataGenerator] Dataset not found at '{path}'. Using fallback.")
             prompts = self._FALLBACK_PROMPTS.copy()
         return prompts
 
-    # ── Discriminator data ──
-
     def generate_discriminator_data(
-        self,
-        num_samples: int = 10_000,
-        batch_size: int = 8,
+        self, num_samples: int = 10_000, batch_size: int = 8,
         save_path: Optional[str] = None,
     ) -> Tuple[List[str], List[str]]:
-        """
-        Generate num_samples real (watermarked) + num_samples natural texts.
-        Returns (real_texts, natural_texts).
-        """
         real_texts, natural_texts = [], []
         num_batches = (num_samples + batch_size - 1) // batch_size
 
@@ -178,7 +169,7 @@ class DataGenerator:
             hi = min(lo + batch_size, num_samples)
             batch = [self.prompts[j % len(self.prompts)] for j in range(lo, hi)]
 
-            wm,  _ = self.oracle.generate_watermarked(batch)
+            wm, _ = self.oracle.generate_watermarked(batch)
             nat, _ = self.oracle.generate_unwatermarked(batch)
             real_texts.extend(wm)
             natural_texts.extend(nat)
@@ -186,7 +177,7 @@ class DataGenerator:
             if (i + 1) % 50 == 0:
                 print(f"[DataGenerator] D-data: {len(real_texts)}/{num_samples}")
 
-        real_texts    = real_texts[:num_samples]
+        real_texts = real_texts[:num_samples]
         natural_texts = natural_texts[:num_samples]
 
         if save_path:
@@ -197,21 +188,12 @@ class DataGenerator:
 
         return real_texts, natural_texts
 
-    # ── Attacker SFT data ──
-
     def generate_attacker_sft_data(
-        self,
-        static_spoofer,
-        attacker_llm,
-        num_samples: int = 10_000,
-        batch_size: int = 8,
+        self, static_spoofer, attacker_llm,
+        num_samples: int = 10_000, batch_size: int = 8,
         save_path: Optional[str] = None,
     ) -> List[dict]:
-        """
-        Generate SFT data for Attacker pre-training.
-        Uses StaticSpoofer to produce spoofed texts, then packages as {prompt, response}.
-        """
-        sft_data   = []
+        sft_data = []
         num_batches = (num_samples + batch_size - 1) // batch_size
 
         for i in range(num_batches):
@@ -220,9 +202,7 @@ class DataGenerator:
             batch = [self.prompts[j % len(self.prompts)] for j in range(lo, hi)]
 
             texts, _ = attacker_llm.generate(
-                batch,
-                max_length=256,
-                temperature=1.0,
+                batch, max_length=256, temperature=1.0,
                 static_spoofer=static_spoofer,
             )
 
@@ -246,19 +226,11 @@ class DataGenerator:
         return sft_data
 
 
-# ──────────────────────────────────────────────────────────────
-# Utility
-# ──────────────────────────────────────────────────────────────
-
 def pad_sequences(
     token_ids_list: List[torch.Tensor],
     pad_value: int = 0,
     max_len: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Pad a list of variable-length 1-D tensors to a common length.
-    Returns (padded_tensor [N, L], lengths_tensor [N]).
-    """
     lengths = [len(ids) for ids in token_ids_list]
     if max_len is None:
         max_len = max(lengths) if lengths else 1
