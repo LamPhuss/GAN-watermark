@@ -1,7 +1,13 @@
 # ============================================================
 # adversarial_loop.py
-# Description: Step 3 — The GAN Adversarial Training Loop
-#   Attacker (G_θ) vs Discriminator (D_φ)
+# Description: Step 3 — GAN Adversarial Training Loop
+#   with Monte Carlo Search and UPV Detector as Discriminator.
+#
+# Changes from original:
+#   - Uses UPVDiscriminatorWrapper (original UPV detector) as D
+#   - MC Search provides per-chunk rewards for Attacker RL update
+#   - Attacker update uses reinforce_loss_mc (chunk-level)
+#   - Discriminator trained on real watermark (1) vs fake watermark (0)
 # ============================================================
 
 import os
@@ -12,47 +18,56 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple, Optional, Dict
 
-from models.detector import WatermarkDiscriminator
+from models.upv_discriminator import UPVDiscriminatorWrapper
 from models.attacker import AttackerLLM, StaticSpoofer
 from data.data_generator import UPVOracle, pad_sequences
+from training.mc_search import MonteCarloSearch, MCSearchResult, reinforce_loss_mc
 from utils.helpers import (
-    GANConfig, set_seed, log_metrics, ensure_dir, 
+    GANConfig, set_seed, log_metrics, ensure_dir,
     compute_ppl_from_logprobs, compute_diversity_score
 )
 
 
 class AdversarialTrainer:
     """
-    Implements the GAN Adversarial Loop (PHẦN 3 in the design doc).
-    
+    GAN Adversarial Training with MC Search + UPV Detector.
+
     The Minimax Game:
-        - D_φ maximizes: E[log D(real)] + E[log(1 - D(fake))]
-        - G_θ maximizes: E[D(fake)] (via REINFORCE policy gradient)
-    
+        - D_φ (UPV Detector) maximizes: E[log D(real)] + E[log(1 - D(fake))]
+        - G_θ (Attacker+LoRA) maximizes: E[D(fake)] via MC-REINFORCE
+
     Each epoch:
-        1. G generates fake watermarked text
-        2. Oracle generates real watermarked text (same prompts)
+        1. MC Search: G generates fake text with per-chunk reward estimation
+        2. Oracle generates real watermarked text
         3. D is updated on (real=1, fake=0)
-        4. G is updated via REINFORCE (reward from updated D)
+        4. G is updated via REINFORCE with chunk-level rewards from MC Search
     """
 
     def __init__(
         self,
         config: GANConfig,
-        discriminator: WatermarkDiscriminator,
+        discriminator: UPVDiscriminatorWrapper,
         attacker: AttackerLLM,
         oracle: UPVOracle,
         static_spoofer: Optional[StaticSpoofer] = None,
     ):
         self.config = config
         self.device = config.device
-        
+
         # Models
         self.discriminator = discriminator
         self.attacker = attacker
         self.oracle = oracle
         self.static_spoofer = static_spoofer
-        
+
+        # Monte Carlo Search
+        self.mc_search = MonteCarloSearch(
+            num_chunks=config.mc_num_chunks,
+            num_rollouts=config.mc_num_rollouts,
+            temperature=config.adv_temperature,
+            device=config.device,
+        )
+
         # Optimizers
         self.d_optimizer = torch.optim.Adam(
             self.discriminator.get_trainable_params(),
@@ -62,13 +77,13 @@ class AdversarialTrainer:
             self.attacker.get_lora_params(),
             lr=config.adv_g_lr,
         )
-        
-        # Loss
+
+        # Loss for Discriminator
         self.bce_loss = nn.BCELoss()
-        
+
         # Load prompts
         self.prompts = self._load_prompts()
-        
+
         # Training history
         self.history: Dict[str, List[float]] = {
             'd_loss': [],
@@ -76,11 +91,17 @@ class AdversarialTrainer:
             'd_reward_real': [],
             'd_reward_fake': [],
             'spoofing_rate': [],
-            'avg_ppl': [],
-            'diversity': [],
+            'chunk_rewards_mean': [],
         }
-        
-        print(f"[AdversarialTrainer] Initialized with {len(self.prompts)} prompts")
+
+        # Log MC Search config
+        print(f"[AdversarialTrainer] MC Search: {config.mc_num_chunks} chunks, "
+              f"{config.mc_num_rollouts} rollouts")
+        print(f"[AdversarialTrainer] Discriminator: UPV Detector (original)")
+        params = self.discriminator.count_params()
+        print(f"[AdversarialTrainer] D params — total: {params['total']:,}, "
+              f"trainable: {params['trainable']:,}, frozen: {params['frozen']:,}")
+        print(f"[AdversarialTrainer] {len(self.prompts)} prompts loaded")
 
     def _load_prompts(self) -> List[str]:
         """Load prompts from dataset."""
@@ -92,7 +113,7 @@ class AdversarialTrainer:
                     if 'prompt' in item:
                         prompts.append(item['prompt'])
             prompts = prompts[:self.config.num_prompts]
-        except:
+        except Exception:
             prompts = [
                 "The latest research in artificial intelligence suggests that",
                 "In a groundbreaking study, scientists discovered that",
@@ -102,9 +123,8 @@ class AdversarialTrainer:
 
     def _get_batch_prompts(self, epoch: int) -> List[str]:
         """Get a batch of prompts for the current epoch."""
-        batch_size = self.config.adv_batch_size
+        batch_size = self.config.mc_batch_size
         start = (epoch * batch_size) % len(self.prompts)
-        
         batch = []
         for i in range(batch_size):
             idx = (start + i) % len(self.prompts)
@@ -112,64 +132,52 @@ class AdversarialTrainer:
         return batch
 
     # ────────────────────────────────────────────────────────────
-    # STEP 3.1: Generation Phase
+    # STEP 3.1: Generation Phase with MC Search
     # ────────────────────────────────────────────────────────────
 
-    def generation_phase(self, prompts: List[str]) -> Tuple[List[str], List[str], torch.Tensor, torch.Tensor]:
+    def generation_phase_mc(
+        self, prompts: List[str]
+    ) -> Tuple[MCSearchResult, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Step 3.1: Attacker generates fake data, Oracle generates real data.
-        
-        Args:
-            prompts: batch of prompts
-        
+        Generation phase using Monte Carlo Search.
+
+        1. Attacker generates fake text with per-chunk MC rewards
+        2. Oracle generates real watermarked text (same prompts)
+
         Returns:
-            (fake_texts, real_texts, fake_token_ids, real_token_ids)
+            (mc_result, real_padded, real_lengths, fake_padded_for_d)
         """
-        # Fake: Attacker generates
-        fake_texts, fake_ids = self.attacker.generate(
-            prompts,
-            max_length=self.config.adv_max_gen_length,
-            temperature=self.config.adv_temperature,
-            do_sample=True,
+        # ── Fake: Attacker generates with MC Search ──
+        mc_result = self.mc_search.generate_with_rewards(
+            attacker=self.attacker,
+            discriminator=self.discriminator,
+            prompts=prompts,
+            max_new_tokens=self.config.adv_max_gen_length,
             static_spoofer=self.static_spoofer,
         )
-        
-        # Real: Oracle generates (frozen UPV Generator)
-        real_texts, real_ids_list = self.oracle.generate_watermarked(
+
+        # ── Real: Oracle generates ──
+        real_texts, _ = self.oracle.generate_watermarked(
             prompts,
-            max_length=self.config.adv_max_gen_length,
+            max_new_tokens=self.config.adv_max_gen_length,
         )
-        
-        # Tokenize real texts using attacker's tokenizer (for D compatibility)
-        real_token_ids_list = []
+
+        # Tokenize real texts using attacker's tokenizer
+        real_ids_list = []
         for text in real_texts:
             ids = self.attacker.tokenizer(
                 text, return_tensors="pt", truncation=True,
-                max_length=self.config.adv_max_gen_length, 
-                add_special_tokens=False,
-            )["input_ids"][0]
-            real_token_ids_list.append(ids)
-        
-        # Pad both to same format
-        fake_token_ids_list = []
-        for i in range(len(fake_texts)):
-            ids = self.attacker.tokenizer(
-                fake_texts[i], return_tensors="pt", truncation=True,
                 max_length=self.config.adv_max_gen_length,
                 add_special_tokens=False,
             )["input_ids"][0]
-            fake_token_ids_list.append(ids)
-        
-        # Pad
+            real_ids_list.append(ids)
+
         pad_id = self.attacker.tokenizer.pad_token_id or 0
-        fake_padded, fake_lengths = pad_sequences(fake_token_ids_list, pad_value=pad_id)
-        real_padded, real_lengths = pad_sequences(real_token_ids_list, pad_value=pad_id)
-        
-        return (
-            fake_texts, real_texts,
-            fake_padded.to(self.device), real_padded.to(self.device),
-            fake_lengths.to(self.device), real_lengths.to(self.device),
-        )
+        real_padded, real_lengths = pad_sequences(real_ids_list, pad_value=pad_id)
+        real_padded = real_padded.to(self.device)
+        real_lengths = real_lengths.to(self.device)
+
+        return mc_result, real_padded, real_lengths
 
     # ────────────────────────────────────────────────────────────
     # STEP 3.2: Discriminator Update
@@ -177,46 +185,74 @@ class AdversarialTrainer:
 
     def update_discriminator(
         self,
-        fake_ids: torch.Tensor, fake_lengths: torch.Tensor,
-        real_ids: torch.Tensor, real_lengths: torch.Tensor,
+        fake_ids: torch.Tensor,
+        real_ids: torch.Tensor,
+        real_lengths: torch.Tensor,
     ) -> Dict[str, float]:
         """
-        Step 3.2: Update Discriminator (D_φ).
-        
+        Update UPV Discriminator.
+
         D is trained to output:
-            - 1 for real watermarked text
-            - 0 for fake (attacker) text
-        
+            - 1 for real watermarked text (from UPV Generator)
+            - 0 for fake/spoofed text (from Attacker)
+
         Loss = BCE(D(real), 1) + BCE(D(fake), 0)
         """
         self.discriminator.train()
-        batch_size = fake_ids.size(0)
-        
-        # Concatenate real and fake
-        all_ids = torch.cat([real_ids, fake_ids], dim=0)
+
+        batch_real = real_ids.size(0)
+        batch_fake = fake_ids.size(0)
+
+        # Pad to same length
+        max_len = max(real_ids.size(1), fake_ids.size(1))
+        pad_id = 0
+
+        if real_ids.size(1) < max_len:
+            pad_real = torch.full(
+                (batch_real, max_len - real_ids.size(1)),
+                pad_id, dtype=torch.long, device=self.device,
+            )
+            real_ids_padded = torch.cat([real_ids, pad_real], dim=1)
+        else:
+            real_ids_padded = real_ids[:, :max_len]
+
+        if fake_ids.size(1) < max_len:
+            pad_fake = torch.full(
+                (batch_fake, max_len - fake_ids.size(1)),
+                pad_id, dtype=torch.long, device=self.device,
+            )
+            fake_ids_padded = torch.cat([fake_ids, pad_fake], dim=1)
+        else:
+            fake_ids_padded = fake_ids[:, :max_len]
+
+        # Fake lengths (approximate from non-pad tokens)
+        fake_lengths = (fake_ids_padded != pad_id).sum(dim=1).clamp(min=1)
+
+        # Concatenate
+        all_ids = torch.cat([real_ids_padded, fake_ids_padded], dim=0)
         all_lengths = torch.cat([real_lengths, fake_lengths], dim=0)
         all_labels = torch.cat([
-            torch.ones(batch_size, device=self.device),   # real = 1
-            torch.zeros(batch_size, device=self.device),  # fake = 0
+            torch.ones(batch_real, device=self.device),
+            torch.zeros(batch_fake, device=self.device),
         ], dim=0)
-        
-        # Forward
+
+        # Forward + backward
         self.d_optimizer.zero_grad()
-        preds = self.discriminator(all_ids, all_lengths).squeeze(-1)  # (2*batch,)
-        
+        preds = self.discriminator(all_ids, all_lengths).squeeze(-1)
+
         d_loss = self.bce_loss(preds, all_labels)
         d_loss.backward()
-        
+
         torch.nn.utils.clip_grad_norm_(
             self.discriminator.get_trainable_params(), max_norm=1.0
         )
         self.d_optimizer.step()
-        
+
         # Metrics
         with torch.no_grad():
-            d_real = preds[:batch_size].mean().item()    # avg D(real)
-            d_fake = preds[batch_size:].mean().item()    # avg D(fake)
-        
+            d_real = preds[:batch_real].mean().item()
+            d_fake = preds[batch_real:].mean().item()
+
         return {
             'd_loss': d_loss.item(),
             'd_reward_real': d_real,
@@ -224,169 +260,129 @@ class AdversarialTrainer:
         }
 
     # ────────────────────────────────────────────────────────────
-    # STEP 3.3: Attacker (Policy Gradient) Update
+    # STEP 3.3: Attacker Update (MC-REINFORCE)
     # ────────────────────────────────────────────────────────────
 
     def update_attacker(
         self,
-        prompts: List[str],
-        fake_texts: List[str],
-        fake_ids: torch.Tensor,
-        fake_lengths: torch.Tensor,
+        mc_result: MCSearchResult,
     ) -> Dict[str, float]:
         """
-        Step 3.3: Update Attacker via REINFORCE Policy Gradient.
-        
-        1. Get reward R from D(fake_text) [higher = better spoofing]
-        2. Compute PPL penalty
-        3. R_total = λ1 * R - λ2 * PPL_normalized
-        4. ∇θ J(θ) = E[R_total · ∇θ log G_θ(y_t | y_{<t})]
-        5. Update LoRA weights via gradient ascent
+        Update Attacker via REINFORCE with per-chunk MC rewards.
+
+        Uses chunk-level rewards from MC Search for better
+        credit assignment than sequence-level REINFORCE.
         """
         self.attacker.model.train()
         self.discriminator.eval()
-        
-        # ── 1) Reward from D ──
-        reward_d = self.discriminator.get_reward(fake_ids, fake_lengths)  # (batch,)
-        
-        # ── 2) PPL penalty ──
-        # Re-tokenize for the attacker model
-        inputs = self.attacker.tokenizer(
-            fake_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.config.adv_max_gen_length,
-        ).to(self.device)
-        
-        with torch.no_grad():
-            log_probs = self.attacker.compute_log_probs(
-                inputs['input_ids'],
-                inputs.get('attention_mask'),
-            )
-        
-        # Per-sequence PPL
-        seq_lengths = inputs['attention_mask'].sum(dim=-1).float() - 1  # -1 for shift
-        seq_lengths = seq_lengths.clamp(min=1)
-        avg_neg_log_prob = -(log_probs * inputs['attention_mask'][:, 1:]).sum(dim=-1) / seq_lengths
-        ppls = torch.exp(avg_neg_log_prob)
-        
-        # Normalize PPL to [0, 1] range (softly)
-        ppl_penalty = torch.sigmoid((ppls - 50) / 20)  # Center around PPL=50
-        
-        # ── 3) Total reward ──
-        R_total = (
-            self.config.adv_lambda_reward * reward_d 
-            - self.config.adv_lambda_ppl * ppl_penalty
-        )
-        
-        # ── 4) REINFORCE loss ──
-        # Compute prompt lengths
-        prompt_lengths = []
-        for prompt in prompts:
-            prompt_ids = self.attacker.tokenizer(prompt, add_special_tokens=True)['input_ids']
-            prompt_lengths.append(len(prompt_ids))
-        prompt_lengths_tensor = torch.tensor(prompt_lengths, device=self.device)
-        
+
+        generated_ids = mc_result.generated_ids
+        chunk_rewards = mc_result.chunk_rewards
+        prompt_lengths = mc_result.prompt_lengths
+
+        # ── PPL penalty (optional) ──
+        ppl_penalty = None
+        if self.config.adv_lambda_ppl > 0:
+            with torch.no_grad():
+                log_probs = self.attacker.compute_log_probs(generated_ids)
+                # Mean neg log prob per sequence
+                gen_mask = torch.zeros_like(log_probs)
+                for b in range(generated_ids.size(0)):
+                    start = max(0, prompt_lengths[b].item() - 1)
+                    gen_mask[b, start:] = 1.0
+                gen_counts = gen_mask.sum(dim=-1).clamp(min=1)
+                avg_nll = -(log_probs * gen_mask).sum(dim=-1) / gen_counts
+                ppls = torch.exp(avg_nll)
+                ppl_penalty = torch.sigmoid((ppls - 50) / 20)
+
+        # ── MC-REINFORCE loss ──
         self.g_optimizer.zero_grad()
-        
-        g_loss = self.attacker.reinforce_loss(
-            generated_ids=inputs['input_ids'],
-            rewards=R_total.detach(),
-            prompt_lengths=prompt_lengths_tensor,
+
+        g_loss = reinforce_loss_mc(
+            attacker=self.attacker,
+            generated_ids=generated_ids,
+            chunk_rewards=chunk_rewards,
+            prompt_lengths=prompt_lengths,
+            num_chunks=self.config.mc_num_chunks,
             baseline=self.config.adv_reward_baseline,
+            lambda_reward=self.config.adv_lambda_reward,
+            ppl_penalty=ppl_penalty,
+            lambda_ppl=self.config.adv_lambda_ppl,
         )
-        
+
         g_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.attacker.get_lora_params(), max_norm=1.0)
         self.g_optimizer.step()
-        
+
         return {
             'g_loss': g_loss.item(),
-            'avg_reward': R_total.mean().item(),
-            'avg_ppl': ppls.mean().item(),
-            'avg_d_score': reward_d.mean().item(),
+            'avg_chunk_reward': chunk_rewards.mean().item(),
+            'chunk_reward_std': chunk_rewards.std().item(),
+            'avg_seq_reward': mc_result.sequence_reward.mean().item(),
         }
 
     # ────────────────────────────────────────────────────────────
-    # EVALUATION (PHẦN 4)
+    # EVALUATION
     # ────────────────────────────────────────────────────────────
 
     def evaluate(self, epoch: int) -> Dict[str, float]:
-        """
-        Evaluate the GAN system (PHẦN 4).
-        
-        Metrics:
-            - D_Loss: Should be stable (~0.5-0.7), not near 0
-            - Spoofing Success Rate: % of fake texts D classifies as real
-            - Diversity Score: Unique tokens ratio (mode collapse detection)
-            - PPL: Quality of generated text
-        """
+        """Evaluate spoofing success and diversity."""
         self.discriminator.eval()
         self.attacker.model.eval()
-        
-        # Generate evaluation samples
-        num_eval = min(100, len(self.prompts))
+
+        num_eval = min(50, len(self.prompts))
         eval_prompts = self.prompts[:num_eval]
-        
-        all_fake_texts = []
-        all_spoofing_results = []
-        all_ppls = []
-        
-        batch_size = self.config.adv_batch_size
-        
+        batch_size = self.config.mc_batch_size
+
+        all_spoofing = []
+        all_token_ids = []
+
         for i in range(0, num_eval, batch_size):
-            batch = eval_prompts[i:i+batch_size]
-            
-            # Generate fake
+            batch = eval_prompts[i : i + batch_size]
+
+            # Generate fake text (no MC search needed for eval — just generate)
             fake_texts, fake_full_ids = self.attacker.generate(
                 batch,
                 max_length=self.config.adv_max_gen_length,
                 temperature=self.config.adv_temperature,
                 static_spoofer=self.static_spoofer,
             )
-            all_fake_texts.extend(fake_texts)
-            
+
             # Tokenize for D
-            fake_token_ids_list = []
+            fake_ids_list = []
             for text in fake_texts:
                 ids = self.attacker.tokenizer(
                     text, return_tensors="pt", truncation=True,
                     max_length=self.config.adv_max_gen_length,
                     add_special_tokens=False,
                 )["input_ids"][0]
-                fake_token_ids_list.append(ids)
-            
+                fake_ids_list.append(ids)
+
             pad_id = self.attacker.tokenizer.pad_token_id or 0
-            fake_padded, fake_lengths = pad_sequences(fake_token_ids_list, pad_value=pad_id)
+            fake_padded, fake_lengths = pad_sequences(fake_ids_list, pad_value=pad_id)
             fake_padded = fake_padded.to(self.device)
             fake_lengths = fake_lengths.to(self.device)
-            
-            # D score
+
             with torch.no_grad():
                 d_scores = self.discriminator(fake_padded, fake_lengths).squeeze(-1)
                 spoofed = (d_scores > 0.5).float()
-                all_spoofing_results.extend(spoofed.cpu().tolist())
-        
-        # Compute metrics
-        spoofing_rate = sum(all_spoofing_results) / max(len(all_spoofing_results), 1)
-        
-        # Diversity score
-        all_token_ids = []
-        for text in all_fake_texts:
-            ids = self.attacker.tokenizer(text, add_special_tokens=False)['input_ids']
-            all_token_ids.append(ids)
+                all_spoofing.extend(spoofed.cpu().tolist())
+
+            for text in fake_texts:
+                ids = self.attacker.tokenizer(text, add_special_tokens=False)["input_ids"]
+                all_token_ids.append(ids)
+
+        spoofing_rate = sum(all_spoofing) / max(len(all_spoofing), 1)
         diversity = compute_diversity_score(all_token_ids)
-        
+
         metrics = {
             'spoofing_rate': spoofing_rate,
             'diversity': diversity,
         }
-        
-        # Check for mode collapse
+
         if diversity < 0.3:
-            print(f"[EVAL] ⚠️  WARNING: Low diversity ({diversity:.3f}) — possible mode collapse!")
-        
+            print(f"[EVAL] ⚠️  Low diversity ({diversity:.3f}) — possible mode collapse!")
+
         return metrics
 
     # ────────────────────────────────────────────────────────────
@@ -395,114 +391,108 @@ class AdversarialTrainer:
 
     def train(self) -> Dict[str, List[float]]:
         """
-        Main adversarial training loop (PHẦN 3).
-        
+        Main adversarial training loop with MC Search.
+
         For each epoch:
-            3.1: Generation — G generates fake, Oracle generates real
-            3.2: D update — train D on (real=1, fake=0)
-            3.3: G update — REINFORCE with R from updated D
-        
-        Returns:
-            Training history dict
+            3.1: MC Generation — G generates with chunk-level reward estimation
+            3.2: D update — train UPV Detector on (real=1, fake=0)
+            3.3: G update — MC-REINFORCE with per-chunk rewards
         """
         print("=" * 60)
-        print("STEP 3: ADVERSARIAL TRAINING LOOP")
+        print("ADVERSARIAL TRAINING (MC Search + UPV Detector)")
+        print(f"  Chunks: {self.config.mc_num_chunks}")
+        print(f"  Rollouts per chunk: {self.config.mc_num_rollouts}")
+        print(f"  Batch size: {self.config.mc_batch_size}")
+        print(f"  Max gen length: {self.config.adv_max_gen_length}")
         print("=" * 60)
-        
+
         for epoch in range(self.config.adv_num_epochs):
             prompts = self._get_batch_prompts(epoch)
-            
-            # ── 3.1: Generation Phase ──
-            result = self.generation_phase(prompts)
-            fake_texts, real_texts, fake_ids, real_ids, fake_lengths, real_lengths = result
-            
+
+            # ── 3.1: MC Generation Phase ──
+            mc_result, real_padded, real_lengths = self.generation_phase_mc(prompts)
+
             # ── 3.2: Update Discriminator ──
             d_metrics = {}
             for _ in range(self.config.adv_d_steps):
                 d_metrics = self.update_discriminator(
-                    fake_ids, fake_lengths,
-                    real_ids, real_lengths,
+                    fake_ids=mc_result.generated_ids,
+                    real_ids=real_padded,
+                    real_lengths=real_lengths,
                 )
-            
-            # ── 3.3: Update Attacker (Policy Gradient) ──
+
+            # ── 3.3: Update Attacker (MC-REINFORCE) ──
             g_metrics = {}
             for _ in range(self.config.adv_g_steps):
-                g_metrics = self.update_attacker(
-                    prompts, fake_texts,
-                    fake_ids, fake_lengths,
-                )
-            
+                g_metrics = self.update_attacker(mc_result)
+
             # Record history
             all_metrics = {**d_metrics, **g_metrics}
             for key, value in all_metrics.items():
                 if key not in self.history:
                     self.history[key] = []
                 self.history[key].append(value)
-            
+
             # Log
             log_metrics(all_metrics, epoch)
-            
+
             # ── Evaluation ──
             if (epoch + 1) % self.config.adv_eval_every == 0:
                 eval_metrics = self.evaluate(epoch)
-                print(f"[EVAL Epoch {epoch:04d}] " + 
-                      " | ".join(f"{k}: {v:.4f}" for k, v in eval_metrics.items()))
-                
+                print(
+                    f"[EVAL Epoch {epoch:04d}] "
+                    + " | ".join(f"{k}: {v:.4f}" for k, v in eval_metrics.items())
+                )
                 for key, value in eval_metrics.items():
                     if key not in self.history:
                         self.history[key] = []
                     self.history[key].append(value)
-            
+
             # ── Checkpoint ──
             if (epoch + 1) % self.config.adv_checkpoint_every == 0:
                 self.save_checkpoint(epoch)
-            
+
             # Memory cleanup
-            del fake_texts, real_texts, fake_ids, real_ids, fake_lengths, real_lengths
+            del mc_result, real_padded, real_lengths
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        
+
         print("=" * 60)
         print("ADVERSARIAL TRAINING COMPLETE")
         print("=" * 60)
-        
         return self.history
 
+    # ── Checkpoint ──
+
     def save_checkpoint(self, epoch: int) -> None:
-        """Save training checkpoint."""
         ensure_dir(self.config.adv_checkpoint_dir)
-        
         checkpoint = {
             'epoch': epoch,
             'discriminator_state': self.discriminator.state_dict(),
             'lora_state': {
-                name: module.state_dict() 
+                name: module.state_dict()
                 for name, module in self.attacker.lora_modules.items()
             },
             'd_optimizer': self.d_optimizer.state_dict(),
             'g_optimizer': self.g_optimizer.state_dict(),
             'history': self.history,
         }
-        
-        path = os.path.join(self.config.adv_checkpoint_dir, f"checkpoint_epoch_{epoch:04d}.pt")
+        path = os.path.join(
+            self.config.adv_checkpoint_dir, f"checkpoint_epoch_{epoch:04d}.pt"
+        )
         torch.save(checkpoint, path)
         print(f"[Checkpoint] Saved to {path}")
-    
+
     def load_checkpoint(self, path: str) -> int:
-        """Load training checkpoint. Returns the epoch number."""
         checkpoint = torch.load(path, map_location=self.device)
-        
         self.discriminator.load_state_dict(checkpoint['discriminator_state'])
-        
         for name, state in checkpoint['lora_state'].items():
             if name in self.attacker.lora_modules:
                 self.attacker.lora_modules[name].load_state_dict(state)
-        
         self.d_optimizer.load_state_dict(checkpoint['d_optimizer'])
         self.g_optimizer.load_state_dict(checkpoint['g_optimizer'])
         self.history = checkpoint['history']
-        
         epoch = checkpoint['epoch']
         print(f"[Checkpoint] Loaded from {path} (epoch {epoch})")
         return epoch
