@@ -99,6 +99,6 @@ evaluation:
 
 # --- Data ---
 data:
-  dataset_path: "data/processed_c4.json"
+  dataset_path: "data/processed_c4.jsonl"
   max_prompt_length: 128
   num_prompts: 5000
