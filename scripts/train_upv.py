@@ -1,24 +1,33 @@
 """
 ============================================================
-train_upv.py
-Train UPV Generator + Detector from scratch.
+train_upv.py — REWRITE matching original THU-BPM repo exactly
 
-Produces:
-  - upv/model/generator_model_b16_p1.pt  (Generator / UPVSubNet)
-  - upv/model/detector_model_b16_p1_z4.pt (Detector)
+5 CRITICAL BUGS FIXED vs previous version:
 
-Pipeline overview:
-  Step 1: Generate random binary training data (NO LLM needed)
-  Step 2: Train Generator network (~43K params, CPU-friendly)
-  Step 3: Generate watermarked text using LLM + Generator (GPU)
-  Step 4: Train Detector using shared embedding from Generator (GPU)
+BUG 1: Generator Architecture WRONG
+  OLD: Simple MLP(16→16→1), 1,105 params, hidden_dim=16
+  FIX: SubNet(16→64→64) + BinaryClassifier with window combine, ~22K params
+
+BUG 2: Watermark Generation WRONG  
+  OLD: generator(context_only) → seed → random partition
+  FIX: generator([context, candidate]) → green/red per token individually
+
+BUG 3: Detector Architecture WRONG
+  OLD: LSTM(input=1, hidden=64, bidirectional)
+  FIX: LSTM(input=64, hidden=128, unidirectional) — original TransformerClassifier
+
+BUG 4: Detector Training Data WRONG
+  OLD: 800 real text with Tag labels
+  FIX: 10,000 random token sequences with z-score > z_value labels
+
+BUG 5: Training Hyperparams WRONG
+  OLD: Generator 50 epochs; Detector 30 epochs, lr=0.001
+  FIX: Generator 300 epochs; Detector 80 epochs, lr=0.0005
 
 Usage:
-  python scripts/train_upv.py                    # all 4 steps
-  python scripts/train_upv.py --step 1           # only step 1
-  python scripts/train_upv.py --step 2           # only step 2
-  python scripts/train_upv.py --step 3 4         # steps 3 and 4
-  python scripts/train_upv.py --llm opt-1.3b     # specify LLM
+  python scripts/train_upv.py                    # all steps
+  python scripts/train_upv.py --step 3 4         # step 3-4 only
+  python scripts/train_upv.py --use_pretrained   # use repo weights
 ============================================================
 """
 
@@ -28,737 +37,533 @@ import json
 import random
 import argparse
 import time
+import copy
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 
-# Add project root to path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 
 # ============================================================
-# UPV Network Architecture (from the paper)
+# Architecture — EXACT copy from original model_key.py
 # ============================================================
 
-class UPVSubNet(nn.Module):
-    """
-    UPV Generator Network.
-    
-    Input:  binary vector (window_size * bit_number,)
-    Output: probability of token being "green" (1,)
-    
-    Architecture: MLP with skip connections
-      Input → FC → ReLU → [FC → ReLU] × (layers-2) → FC → Sigmoid
-    
-    The paper uses this to split vocabulary into green/red lists
-    based on preceding token context.
-    """
-
-    def __init__(self, bit_number: int = 16, window_size: int = 1, layers: int = 5):
+class SubNet(nn.Module):
+    """Shared embedding: binary token → 64-dim feature. Output=64, NOT 1."""
+    def __init__(self, input_dim, num_layers, hidden_dim=64):
         super().__init__()
-        input_dim = bit_number * window_size
-        hidden_dim = bit_number * window_size  # Same as input
+        self.layers = nn.ModuleList()
+        self.layers.append(nn.Linear(input_dim, hidden_dim))
+        self.layers.append(nn.ReLU())
+        for _ in range(num_layers - 1):
+            self.layers.append(nn.Linear(hidden_dim, hidden_dim))
+            self.layers.append(nn.ReLU())
+        self.layers.append(nn.Linear(hidden_dim, hidden_dim))
 
-        modules = []
-        modules.append(nn.Linear(input_dim, hidden_dim))
-        modules.append(nn.ReLU())
-
-        for _ in range(layers - 2):
-            modules.append(nn.Linear(hidden_dim, hidden_dim))
-            modules.append(nn.ReLU())
-
-        modules.append(nn.Linear(hidden_dim, 1))
-        modules.append(nn.Sigmoid())
-
-        self.network = nn.Sequential(*modules)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.network(x)
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
 
-class UPVDetectorNet(nn.Module):
-    """
-    UPV Detector Network.
-    
-    Input:  sequence of binary vectors (seq_len, bit_number)
-    Output: probability of sequence being watermarked (1,)
-    
-    Architecture: 
-      binary_classifier (shared from Generator) → LSTM → FC → Sigmoid
-    
-    CRITICAL: binary_classifier weights come from the trained Generator
-    and should NOT be fine-tuned (paper shows -11.1% F1 if fine-tuned).
-    """
-
-    def __init__(
-        self,
-        bit_number: int = 16,
-        hidden_size: int = 64,
-        num_lstm_layers: int = 2,
-    ):
+class BinaryClassifier(nn.Module):
+    """Full generator: (batch, window_size, bit_number) → (batch, 1) green prob."""
+    def __init__(self, input_dim, window_size, num_layers, hidden_dim=64):
         super().__init__()
-        self.bit_number = bit_number
+        self.sub_net = SubNet(input_dim, num_layers, hidden_dim)
+        self.window_size = window_size
+        self.relu = nn.ReLU()
+        self.combine_layer = nn.Linear(window_size * hidden_dim, hidden_dim)
+        self.output_layer = nn.Linear(hidden_dim, 1)
+        self.sigmoid = nn.Sigmoid()
 
-        # Shared embedding from Generator (will be loaded later)
-        self.binary_classifier = None  # Set after generator training
+    def forward(self, x):
+        batch_size = x.shape[0]
+        x = x.view(-1, x.shape[-1])
+        sub_net_output = self.sub_net(x)
+        sub_net_output = sub_net_output.view(batch_size, -1)
+        combined = self.combine_layer(sub_net_output)
+        combined = self.relu(combined)
+        output = self.output_layer(combined)
+        return self.sigmoid(output)
 
-        # LSTM processes sequence of embeddings
-        self.lstm = nn.LSTM(
-            input_size=1,  # Output of binary_classifier per token
-            hidden_size=hidden_size,
-            num_layers=num_lstm_layers,
-            batch_first=True,
-            bidirectional=True,
-        )
 
-        # Classification head
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 2, 32),  # *2 for bidirectional
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(32, 1),
-            nn.Sigmoid(),
-        )
+class TransformerClassifier(nn.Module):
+    """Detector: EXACT copy from original detector.py."""
+    def __init__(self, bit_number, b_layers, input_dim, hidden_dim, num_classes=1, num_layers=2):
+        super().__init__()
+        self.binary_classifier = SubNet(bit_number, b_layers)
+        self.classifier = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc_hidden = nn.Linear(hidden_dim, hidden_dim)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+        self.sigmoid = nn.Sigmoid()
 
-    def set_shared_embedding(self, generator: UPVSubNet):
-        """Copy generator network as shared embedding (frozen)."""
-        self.binary_classifier = generator
-        # FREEZE shared embedding
-        for param in self.binary_classifier.parameters():
-            param.requires_grad = False
-        print("[Detector] Shared embedding set and FROZEN")
-
-    def forward(self, binary_seq: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            binary_seq: (batch, seq_len, bit_number)
-        Returns:
-            (batch, 1) watermark probability
-        """
-        batch_size, seq_len, bit_num = binary_seq.shape
-
-        # Apply shared embedding to each token
-        flat = binary_seq.reshape(-1, bit_num)  # (batch*seq, bit_num)
-        with torch.no_grad():  # Shared embedding is frozen
-            token_scores = self.binary_classifier(flat)  # (batch*seq, 1)
-        token_scores = token_scores.reshape(batch_size, seq_len, 1)
-
-        # LSTM over sequence
-        lstm_out, _ = self.lstm(token_scores)  # (batch, seq, hidden*2)
-
-        # Use last hidden state
-        last_hidden = lstm_out[:, -1, :]  # (batch, hidden*2)
-
-        # Classify
-        prob = self.fc(last_hidden)  # (batch, 1)
-        return prob
+    def forward(self, x):
+        batch_size, seq_len, _ = x.size()
+        x1 = x.view(batch_size * seq_len, -1)
+        features = self.binary_classifier(x1)
+        features = features.view(batch_size, seq_len, -1)
+        output, _ = self.classifier(features)
+        output = self.fc_hidden(output[:, -1, :])
+        output = self.sigmoid(output)
+        output = self.fc(output)
+        return self.sigmoid(output)
 
 
 # ============================================================
-# Step 1: Generate Training Data
+# Helpers
 # ============================================================
 
-def int_to_bin(val: int, bit_number: int) -> list:
-    """Convert integer to binary list (MSB first)."""
-    return [(val >> (bit_number - 1 - i)) & 1 for i in range(bit_number)]
+def int_to_bin_list(n, length=16):
+    return [int(b) for b in format(n, 'b').zfill(length)]
+
+def get_value(input_x, model):
+    with torch.no_grad():
+        return (model(input_x) > 0.5).bool().item()
+
+def max_number(bits):
+    return (1 << bits) - 1
 
 
-def generate_training_data(
-    bit_number: int = 16,
-    window_size: int = 1,
-    sample_number: int = 2000,
-    seq_length: int = 200,
-    output_file: str = "upv/train_data/train_generator_data.jsonl",
-):
-    """
-    Step 1: Generate random binary training data for Generator.
-    
-    Each sample is a random token ID sequence. For each position,
-    we extract the context window (preceding tokens in binary) and
-    assign a random green/red label.
-    
-    The Generator will learn to produce ~50% green tokens for any
-    input context, creating a balanced green/red split.
-    
-    NO LLM needed — purely random data.
-    """
+# ============================================================
+# Step 1: Generate Training Data for Generator
+# ============================================================
+
+def generate_generator_data(bit_number, sample_number, output_file, window_size):
+    """EXACT copy of original generate_data.py."""
     print("=" * 60)
     print("STEP 1: Generate Training Data for Generator")
-    print(f"  bit_number: {bit_number}")
-    print(f"  window_size: {window_size}")
-    print(f"  samples: {sample_number}")
+    print(f"  bit={bit_number}, window={window_size}, samples={sample_number}")
     print("=" * 60)
 
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    max_val = 2 ** bit_number
-
+    numbers = list(range(1, max_number(bit_number)))
     data = []
-    for i in range(sample_number):
-        # Random token ID sequence
-        seq = [random.randint(0, max_val - 1) for _ in range(seq_length)]
+    for _ in range(sample_number):
+        labels = [0, 1]
+        random.shuffle(labels)
+        combined = []
+        for _ in range(window_size - 1):
+            combined.append(int_to_bin_list(random.choice(numbers), bit_number))
+        for label in labels:
+            combined1 = copy.deepcopy(combined)
+            combined1.append(int_to_bin_list(random.choice(numbers), bit_number))
+            data.append({"data": combined1, "label": label})
 
-        # For each position, create (context_binary, label) pairs
-        for pos in range(window_size, len(seq)):
-            # Context: preceding `window_size` tokens as binary
-            ctx_tokens = seq[pos - window_size : pos]
-            ctx_binary = []
-            for t in ctx_tokens:
-                ctx_binary.extend(int_to_bin(t, bit_number))
-
-            # Current token binary
-            cur_binary = int_to_bin(seq[pos], bit_number)
-
-            # Target: we want ~50% green, so label = hash-based assignment
-            # Simple approach: sum of context bits mod 2
-            label = sum(ctx_binary) % 2
-
-            data.append({
-                "context": ctx_binary,
-                "token": cur_binary,
-                "label": label,
-            })
-
-        if (i + 1) % 500 == 0:
-            print(f"  Generated {i + 1}/{sample_number} sequences ({len(data)} samples)")
-
-    # Save
-    with open(output_file, "w") as f:
-        for item in data:
-            f.write(json.dumps(item) + "\n")
-
-    print(f"  ✓ Saved {len(data)} training samples to {output_file}")
-    return output_file
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, 'w') as f:
+        for entry in data:
+            f.write(json.dumps(entry) + '\n')
+    print(f"  ✓ {len(data)} samples → {output_file}")
 
 
 # ============================================================
 # Step 2: Train Generator
 # ============================================================
 
-class GeneratorDataset(Dataset):
-    def __init__(self, data_file: str):
-        self.samples = []
-        with open(data_file) as f:
-            for line in f:
-                item = json.loads(line)
-                self.samples.append((
-                    torch.tensor(item["context"], dtype=torch.float32),
-                    torch.tensor([item["label"]], dtype=torch.float32),
-                ))
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        return self.samples[idx]
-
-
-def train_generator(
-    data_file: str,
-    bit_number: int = 16,
-    window_size: int = 1,
-    layers: int = 5,
-    output_dir: str = "upv/model",
-    epochs: int = 50,
-    lr: float = 0.001,
-    batch_size: int = 256,
-    device: str = "cpu",
-):
-    """
-    Step 2: Train Generator network (UPVSubNet).
-    
-    This is a tiny network (~43K params). Trains in minutes on CPU.
-    
-    The Generator learns to assign green/red labels to tokens based
-    on context. After training, it should produce ~50% green tokens
-    for any random context (balanced split).
-    
-    Output: generator_model_b16_p1.pt (= sub_net.pt in original repo)
-    """
+def train_generator(data_dir, bit_number, model_dir, window_size, layers,
+                    epochs=300, lr=0.001, batch_size=32, device="cuda"):
+    """EXACT copy of original model_key.py train_model()."""
     print("=" * 60)
-    print("STEP 2: Train Generator Network (UPVSubNet)")
-    print(f"  bit_number: {bit_number}, window_size: {window_size}")
-    print(f"  layers: {layers}, epochs: {epochs}")
-    print(f"  device: {device}")
+    print("STEP 2: Train Generator (BinaryClassifier)")
+    print(f"  bit={bit_number}, window={window_size}, layers={layers}, epochs={epochs}")
     print("=" * 60)
 
-    os.makedirs(output_dir, exist_ok=True)
+    import numpy as np
+    features, labels = [], []
+    with open(data_dir) as f:
+        for line in f:
+            entry = json.loads(line)
+            features.append(entry['data'])
+            labels.append(entry['label'])
 
-    # Dataset
-    dataset = GeneratorDataset(data_file)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    print(f"  Training samples: {len(dataset)}")
+    train_data = TensorDataset(
+        torch.from_numpy(np.array(features)),
+        torch.from_numpy(np.array(labels))
+    )
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
+    print(f"  Samples: {len(features)}")
 
-    # Model
-    model = UPVSubNet(bit_number=bit_number, window_size=window_size, layers=layers)
-    model.to(device)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"  Generator params: {total_params:,}")
+    model = BinaryClassifier(bit_number, window_size, layers).to(device)
+    print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
 
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
-    # Training
-    best_loss = float("inf")
+    model.train()
     for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-        correct = 0
-        total = 0
-
-        for ctx, label in loader:
-            ctx, label = ctx.to(device), label.to(device)
-            pred = model(ctx)
-            loss = criterion(pred, label)
-
+        for inputs, targets in train_loader:
+            outputs = model(inputs.float().to(device))
+            loss = criterion(outputs.squeeze(), targets.float().to(device))
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+        if (epoch + 1) % 50 == 0 or epoch == 0:
+            print(f"  Epoch {epoch+1:3d}/{epochs} | Loss: {loss.item():.4f}")
 
-            total_loss += loss.item() * ctx.size(0)
-            correct += ((pred > 0.5).float() == label).sum().item()
-            total += ctx.size(0)
-
-        avg_loss = total_loss / total
-        acc = correct / total
-
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"  Epoch {epoch + 1:3d}/{epochs} | Loss: {avg_loss:.4f} | Acc: {acc:.4f}")
-
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            save_path = os.path.join(output_dir, "generator_model_b16_p1.pt")
-            torch.save(model.state_dict(), save_path)
-
-    save_path = os.path.join(output_dir, "generator_model_b16_p1.pt")
-    torch.save(model.state_dict(), save_path)
-    print(f"  ✓ Generator saved to {save_path}")
-    print(f"  ✓ Best loss: {best_loss:.4f}")
-
+    os.makedirs(model_dir, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(model_dir, "combine_model.pt"))
+    torch.save(model.sub_net.state_dict(), os.path.join(model_dir, "sub_net.pt"))
+    print(f"  ✓ Saved combine_model.pt + sub_net.pt → {model_dir}")
     return model
 
 
 # ============================================================
-# Step 3: Generate Watermarked Text Data
+# Step 3: WatermarkEngine (generate train + test data)
 # ============================================================
 
-def generate_watermarked_data(
-    generator_path: str,
-    llm_name: str = "facebook/opt-1.3b",
-    bit_number: int = 16,
-    window_size: int = 1,
-    delta: float = 2.0,
-    num_samples: int = 500,
-    max_new_tokens: int = 200,
-    output_dir: str = "upv/data",
-    data_path: str = None,
-    device: str = "cuda",
-):
-    """
-    Step 3: Generate watermarked + unwatermarked text.
-    
-    Uses the trained Generator to modify LLM logits during generation:
-    - Green tokens get +delta boost to their logits
-    - Red tokens remain unchanged
-    
-    This creates the distribution shift that makes watermarked
-    text detectable.
-    
-    REQUIRES GPU for LLM inference.
-    """
-    print("=" * 60)
-    print("STEP 3: Generate Watermarked Text Data")
-    print(f"  LLM: {llm_name}")
-    print(f"  delta: {delta}, samples: {num_samples}")
-    print(f"  device: {device}")
-    print("=" * 60)
+class WatermarkEngine:
+    """Matches original watermark_model.py. Key: green/red depends on BOTH context AND candidate."""
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    def __init__(self, bit_number, window_size, layers, delta, model_dir, device="cuda"):
+        self.bit_number = bit_number
+        self.vocab = list(range(1, 2 ** bit_number - 1))
+        self.window_size = window_size
+        self.delta = delta
+        self.cache = {}
+        self.device = device
 
-    os.makedirs(output_dir, exist_ok=True)
+        self.model = BinaryClassifier(bit_number, window_size, layers)
+        self.model.load_state_dict(torch.load(
+            os.path.join(model_dir, "combine_model.pt"), map_location=device
+        ))
+        self.model = self.model.to(device).eval()
+        print(f"  ✓ BinaryClassifier loaded")
 
-    # Load Generator
-    generator = UPVSubNet(bit_number=bit_number, window_size=window_size)
-    generator.load_state_dict(torch.load(generator_path, map_location=device))
-    generator.to(device)
-    generator.eval()
-    print(f"  ✓ Generator loaded from {generator_path}")
+    def judge_green(self, input_ids, current_number):
+        last_nums = input_ids[-(self.window_size - 1):] if self.window_size - 1 > 0 else []
+        pair = list(last_nums) + [current_number]
+        key = tuple(int(x) for x in pair)
+        bin_list = [int_to_bin_list(int(n), self.bit_number) for n in pair]
 
-    # Load LLM
-    print(f"  Loading LLM: {llm_name}...")
-    load_kwargs = {"torch_dtype": torch.float16}
-    try:
-        import flash_attn
-        load_kwargs["attn_implementation"] = "flash_attention_2"
-        print("  [FlashAttn] Using flash_attention_2")
-    except ImportError:
-        print("  [FlashAttn] Not available, using default")
+        if key in self.cache:
+            return self.cache[key]
+        result = get_value(torch.FloatTensor(bin_list).unsqueeze(0).to(self.device), self.model)
+        self.cache[key] = result
+        return result
 
-    model = AutoModelForCausalLM.from_pretrained(llm_name, **load_kwargs).to(device)
-    tokenizer = AutoTokenizer.from_pretrained(llm_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    model.eval()
+    def random_sample(self, input_ids, is_green):
+        last_nums = input_ids[-(self.window_size - 1):] if self.window_size - 1 > 0 else []
+        while True:
+            number = random.choice(self.vocab)
+            pair = list(last_nums) + [number]
+            key = tuple(int(x) for x in pair)
+            bin_list = [int_to_bin_list(int(n), self.bit_number) for n in pair]
+            if key in self.cache:
+                result = self.cache[key]
+            else:
+                result = get_value(torch.FloatTensor(bin_list).unsqueeze(0).to(self.device), self.model)
+                self.cache[key] = result
+            if is_green and result:
+                return number
+            elif not is_green and not result:
+                return number
 
-    # Load prompts
-    prompts = _load_c4_prompts(tokenizer, num_samples, data_path=data_path)
+    def green_token_mask_and_stats(self, token_ids):
+        token_ids = [int(x) for x in token_ids]
+        green_mask = []
+        for i in range(len(token_ids)):
+            if i < self.window_size - 1:
+                if self.window_size - 1 > 0:
+                    ctx = token_ids[-(self.window_size - 1 - i):] + token_ids[:i]
+                else:
+                    ctx = []
+                green_mask.append(1 if self.judge_green(torch.LongTensor(ctx), token_ids[i]) else 0)
+            else:
+                ctx = token_ids[i - (self.window_size - 1):i]
+                green_mask.append(1 if self.judge_green(torch.LongTensor(ctx), token_ids[i]) else 0)
 
-    # Generate
-    watermarked_data = []
-    unwatermarked_data = []
+        gc = sum(green_mask)
+        total = len(green_mask)
+        from math import sqrt
+        z = (gc - total * 0.5) / sqrt(total * 0.25) if total > 0 else 0.0
+        return green_mask, gc, z
 
-    for i, prompt in enumerate(prompts):
-        # Watermarked generation
-        wm_text, wm_z = _generate_single(
-            model, tokenizer, generator, prompt,
-            bit_number, window_size, delta, max_new_tokens, device,
-            watermark=True,
-        )
-        watermarked_data.append({"Input": wm_text, "Tag": 1, "Z-score": wm_z})
+    def generate_list_with_green_ratio(self, length, green_ratio):
+        token_list = (random.sample(self.vocab, self.window_size - 1)
+                      if self.window_size - 1 > 0 else random.sample(self.vocab, 1))
+        is_green = []
+        while len(token_list) < length:
+            green = 1 if random.random() < green_ratio else 0
+            token = self.random_sample(torch.LongTensor(token_list), green == 1)
+            token_list.append(token)
+            is_green.append(green)
 
-        # Unwatermarked generation (same prompt)
-        nat_text, nat_z = _generate_single(
-            model, tokenizer, generator, prompt,
-            bit_number, window_size, delta, max_new_tokens, device,
-            watermark=False,
-        )
-        unwatermarked_data.append({"Input": nat_text, "Tag": 0, "Z-score": nat_z})
+        # Cyclic labeling for initial tokens
+        is_green_append = []
+        for i in range(self.window_size - 1):
+            tail = token_list[-(self.window_size - 1 - i):]
+            head = token_list[:i]
+            is_green_append.append(
+                1 if self.judge_green(torch.LongTensor(tail + head), token_list[i]) else 0
+            )
+        is_green = is_green_append + is_green
+        return token_list, is_green
 
-        if (i + 1) % 50 == 0:
-            print(f"  Generated {i + 1}/{num_samples} pairs")
+    def generate_train_data(self, num_samples, output_dir):
+        """Detector training data: random token sequences with z-score labels."""
+        from tqdm import tqdm
+        train_data = []
+        for _ in tqdm(range(num_samples), desc="  Generating detector train data"):
+            green_ratio = random.random()
+            token_list, is_green = self.generate_list_with_green_ratio(200, green_ratio)
+            _, _, z_score = self.green_token_mask_and_stats(token_list)
+            train_data.append((tuple(token_list), tuple(is_green), z_score))
 
-    # Save
-    train_path = os.path.join(output_dir, "train_data.jsonl")
-    test_path = os.path.join(output_dir, "test_data.jsonl")
+        train_data = list(set(train_data))
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, 'train_data.jsonl')
+        with open(path, 'w') as f:
+            for item in train_data:
+                json.dump({"Input": list(item[0]), "Tag": list(item[1]), "Output": item[2]}, f)
+                f.write('\n')
+        print(f"  ✓ {len(train_data)} train samples → {path}")
+        return path
 
-    # 80/20 split
-    split = int(0.8 * len(watermarked_data))
-    all_data = watermarked_data + unwatermarked_data
-    random.shuffle(all_data)
+    def generate_test_data(self, llm_name, output_dir, data_path=None,
+                           sampling_temp=0.7, max_new_tokens=200, num_samples=500):
+        """Test data: real watermarked + natural text using LLM."""
+        from transformers import (AutoModelForCausalLM, AutoTokenizer,
+                                  LogitsProcessor, LogitsProcessorList)
 
-    with open(train_path, "w") as f:
-        for item in all_data[:split * 2]:
-            f.write(json.dumps(item) + "\n")
+        print(f"  Loading LLM: {llm_name}...")
+        device = self.device
+        tokenizer = AutoTokenizer.from_pretrained(llm_name, use_fast=False)
+        load_kwargs = {"torch_dtype": torch.float16}
+        try:
+            import flash_attn
+            load_kwargs["attn_implementation"] = "flash_attention_2"
+            print("  [FlashAttn] Using flash_attention_2")
+        except ImportError:
+            pass
+        model = AutoModelForCausalLM.from_pretrained(llm_name, **load_kwargs).to(device)
 
-    with open(test_path, "w") as f:
-        for item in all_data[split * 2:]:
-            f.write(json.dumps(item) + "\n")
+        engine = self
 
-    print(f"  ✓ Train data: {train_path} ({split * 2} samples)")
-    print(f"  ✓ Test data: {test_path} ({len(all_data) - split * 2} samples)")
+        class WMProcessor(LogitsProcessor):
+            def __call__(self, input_ids, scores):
+                if input_ids.shape[-1] < engine.window_size - 1:
+                    return scores
+                for b in range(input_ids.shape[0]):
+                    ids = input_ids[b]
+                    if engine.window_size - 1 > 0:
+                        last = ids[-(engine.window_size - 1):].cpu().tolist()
+                    else:
+                        last = []
+                    _, cands = torch.topk(scores[b], k=min(20, scores.shape[-1]))
+                    greens = []
+                    for v in cands:
+                        pair = last + [int(v)]
+                        key = tuple(int(x) for x in pair)
+                        bins = [int_to_bin_list(int(n), engine.bit_number) for n in pair]
+                        if key in engine.cache:
+                            r = engine.cache[key]
+                        else:
+                            r = get_value(torch.FloatTensor(bins).unsqueeze(0).to(device), engine.model)
+                            engine.cache[key] = r
+                        if r:
+                            greens.append(int(v))
+                    if greens:
+                        scores[b][greens] += engine.delta
+                    if "opt" in llm_name:
+                        scores[b][2] = -10000
+                return scores
 
-    # Cleanup LLM to free VRAM
-    del model
-    torch.cuda.empty_cache()
+        prompts = _load_prompts(tokenizer, num_samples, data_path)
+        wm_out, nat_out = [], []
 
-    return train_path, test_path
+        for i, prompt_text in enumerate(prompts):
+            try:
+                inp = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=True).to(device)
+                plen = inp["input_ids"].shape[-1]
+
+                with torch.no_grad():
+                    out_wm = model.generate(
+                        **inp, logits_processor=LogitsProcessorList([WMProcessor()]),
+                        max_new_tokens=max_new_tokens, do_sample=True,
+                        top_k=20, temperature=sampling_temp, no_repeat_ngram_size=4,
+                    )
+                gen_wm = out_wm[0, plen:].cpu().tolist()
+                _, _, z_wm = self.green_token_mask_and_stats(gen_wm)
+                wm_out.append({"Input": tokenizer.decode(gen_wm, skip_special_tokens=True),
+                               "Tag": 1, "Z-score": z_wm})
+
+                with torch.no_grad():
+                    out_nat = model.generate(
+                        **inp, max_new_tokens=max_new_tokens, do_sample=True,
+                        top_k=20, temperature=sampling_temp,
+                    )
+                gen_nat = out_nat[0, plen:].cpu().tolist()
+                _, _, z_nat = self.green_token_mask_and_stats(gen_nat)
+                nat_out.append({"Input": tokenizer.decode(gen_nat, skip_special_tokens=True),
+                                "Tag": 0, "Z-score": z_nat})
+
+                if (i + 1) % 50 == 0:
+                    print(f"  {i+1}/{num_samples} (wm z={z_wm:.2f}, nat z={z_nat:.2f})")
+            except Exception as e:
+                print(f"  ⚠ Sample {i}: {e}")
+
+        path = os.path.join(output_dir, 'test_data.jsonl')
+        with open(path, 'w') as f:
+            for item in wm_out + nat_out:
+                json.dump(item, f)
+                f.write('\n')
+        print(f"  ✓ {len(wm_out)} wm + {len(nat_out)} nat → {path}")
+        del model; torch.cuda.empty_cache()
+        return path
 
 
-def _load_c4_prompts(tokenizer, num_samples: int, data_path: str = None) -> list:
-    """Load prompts from user's processed_c4.json or fallback to HuggingFace C4."""
-    
-    # Priority 1: User's processed_c4.json
+def _load_prompts(tokenizer, num_samples, data_path=None):
     if data_path and os.path.exists(data_path):
         prompts = []
-        try:
-            with open(data_path, "r") as f:
-                for line in f:
-                    item = json.loads(line)
-                    if "prompt" in item:
-                        prompts.append(item["prompt"])
-                    elif "text" in item:
-                        # Extract first 30 tokens as prompt
-                        tokens = tokenizer(item["text"], add_special_tokens=False)["input_ids"]
-                        if len(tokens) > 30:
-                            prompts.append(tokenizer.decode(tokens[:30]))
-                    if len(prompts) >= num_samples:
-                        break
-            print(f"  ✓ Loaded {len(prompts)} prompts from {data_path}")
-            return prompts
-        except Exception as e:
-            print(f"  ⚠ Error reading {data_path}: {e}")
-    
-    # Priority 2: HuggingFace C4
-    try:
-        from datasets import load_dataset
-        ds = load_dataset("allenai/c4", "en", split="validation", streaming=True)
-        prompts = []
-        for item in ds:
-            text = item["text"]
-            tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
-            if len(tokens) > 30:
-                prompt = tokenizer.decode(tokens[:30])
-                prompts.append(prompt)
-            if len(prompts) >= num_samples:
+        with open(data_path) as f:
+            content = f.read()
+        decoder = json.JSONDecoder()
+        idx = 0
+        while idx < len(content) and len(prompts) < num_samples:
+            s = content[idx:].lstrip()
+            if not s: break
+            if s[0] in '[],':
+                idx += len(content[idx:]) - len(s) + 1; continue
+            try:
+                obj, end = decoder.raw_decode(s)
+                idx += len(content[idx:]) - len(s) + end
+            except json.JSONDecodeError:
                 break
-        return prompts
-    except Exception as e:
-        print(f"  ⚠ Could not load C4: {e}. Using fallback prompts.")
-        base = [
-            "The latest research in artificial intelligence suggests that",
+            if isinstance(obj, dict):
+                if "prompt" in obj: prompts.append(obj["prompt"])
+                elif "text" in obj:
+                    toks = tokenizer(obj["text"], add_special_tokens=False)["input_ids"]
+                    if len(toks) > 30: prompts.append(tokenizer.decode(toks[:30]))
+        if prompts:
+            print(f"  ✓ {len(prompts)} prompts from {data_path}")
+            return prompts
+    print("  Using fallback prompts")
+    base = ["The latest research in artificial intelligence suggests that",
             "In a groundbreaking study, scientists discovered that",
             "The economic impact of climate change has been",
             "According to recent findings in neuroscience,",
             "New regulations aimed at reducing carbon emissions",
             "The relationship between diet and mental health",
             "Advances in renewable energy technology have",
-            "The global supply chain disruptions caused by",
-        ]
-        return [base[i % len(base)] for i in range(num_samples)]
-
-
-@torch.no_grad()
-def _generate_single(
-    model, tokenizer, generator, prompt,
-    bit_number, window_size, delta, max_new_tokens, device,
-    watermark=True,
-):
-    """Generate a single text with or without watermark."""
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    input_ids = inputs["input_ids"]
-    max_val = 2 ** bit_number
-
-    for _ in range(max_new_tokens):
-        outputs = model(input_ids)
-        logits = outputs.logits[:, -1, :]  # (1, vocab)
-
-        if watermark:
-            # Get context tokens for generator
-            ctx_start = max(0, input_ids.size(1) - window_size)
-            ctx_tokens = input_ids[0, ctx_start:].tolist()
-
-            # For each vocab token, check if it's "green"
-            vocab_size = logits.size(-1)
-            for tok_id in range(min(vocab_size, max_val)):
-                ctx_binary = []
-                for t in ctx_tokens:
-                    ctx_binary.extend(int_to_bin(t % max_val, bit_number))
-                # Pad if context shorter than window_size
-                while len(ctx_binary) < bit_number * window_size:
-                    ctx_binary = [0] * bit_number + ctx_binary
-
-                tok_binary = int_to_bin(tok_id, bit_number)
-                full_input = ctx_binary + tok_binary
-
-                # Check generator output
-                inp = torch.tensor(
-                    ctx_binary[-bit_number * window_size:],
-                    dtype=torch.float32, device=device,
-                ).unsqueeze(0)
-                green_prob = generator(inp).item()
-
-                if green_prob > 0.5:
-                    logits[0, tok_id] += delta  # Boost green tokens
-
-        # Sample
-        probs = torch.softmax(logits / 0.7, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-        input_ids = torch.cat([input_ids, next_token], dim=-1)
-
-        if next_token.item() == tokenizer.eos_token_id:
-            break
-
-    generated = input_ids[0, inputs["input_ids"].size(1):]
-    text = tokenizer.decode(generated, skip_special_tokens=True)
-
-    # Compute z-score
-    z_score = _compute_z_score(generator, generated, bit_number, window_size, device)
-
-    return text, z_score
-
-
-def _compute_z_score(
-    generator, token_ids, bit_number, window_size, device,
-) -> float:
-    """Compute z-score: how many tokens are 'green'."""
-    max_val = 2 ** bit_number
-    green_count = 0
-    total = 0
-
-    for i in range(window_size, len(token_ids)):
-        ctx_start = max(0, i - window_size)
-        ctx_tokens = token_ids[ctx_start:i].tolist()
-
-        ctx_binary = []
-        for t in ctx_tokens:
-            ctx_binary.extend(int_to_bin(t % max_val, bit_number))
-        while len(ctx_binary) < bit_number * window_size:
-            ctx_binary = [0] * bit_number + ctx_binary
-
-        inp = torch.tensor(
-            ctx_binary[-bit_number * window_size:],
-            dtype=torch.float32, device=device,
-        ).unsqueeze(0)
-
-        green_prob = generator(inp).item()
-        if green_prob > 0.5:
-            green_count += 1
-        total += 1
-
-    if total == 0:
-        return 0.0
-
-    # z = (green_count - T/2) / sqrt(T/4)
-    expected = total * 0.5
-    std = (total * 0.25) ** 0.5
-    z = (green_count - expected) / (std + 1e-8)
-    return z
+            "The global supply chain disruptions caused by"]
+    return [base[i % len(base)] for i in range(num_samples)]
 
 
 # ============================================================
 # Step 4: Train Detector
 # ============================================================
 
-def train_detector(
-    generator_path: str,
-    train_data_path: str,
-    llm_name: str = "facebook/opt-1.3b",
-    bit_number: int = 16,
-    window_size: int = 1,
-    z_value: float = 4.0,
-    output_dir: str = "upv/model",
-    epochs: int = 30,
-    lr: float = 0.001,
-    batch_size: int = 32,
-    device: str = "cuda",
-):
-    """
-    Step 4: Train Detector network.
-    
-    The Detector shares its binary_classifier (embedding layer)
-    with the Generator. This shared embedding is FROZEN — only
-    the LSTM and FC layers are trained.
-    
-    Training data: watermarked text (label=1) vs natural text (label=0)
-    """
+def pad_to_fixed(inputs, target_length):
+    padded = torch.nn.utils.rnn.pad_sequence(inputs, batch_first=True)
+    L = padded.shape[1]
+    if L < target_length:
+        padded = F.pad(padded, (0, 0, 0, target_length - L))
+    elif L > target_length:
+        padded = padded[:, :target_length, :]
+    return padded
+
+def train_collate(batch):
+    return pad_to_fixed([b[0] for b in batch], 200), torch.stack([b[1] for b in batch])
+
+def test_collate(batch):
+    return (pad_to_fixed([b[0] for b in batch], 200),
+            torch.stack([b[1] for b in batch]),
+            torch.stack([b[2] for b in batch]))
+
+
+def train_detector(bit_number, input_dir, model_file, output_model_dir,
+                   b_layers, z_value, llm_name, epochs=80, lr=0.0005, device="cuda"):
+    """EXACT copy of original detector.py."""
     print("=" * 60)
-    print("STEP 4: Train Detector Network")
-    print(f"  generator: {generator_path}")
-    print(f"  z_value threshold: {z_value}")
-    print(f"  device: {device}")
+    print("STEP 4: Train Detector (TransformerClassifier)")
+    print(f"  epochs={epochs}, lr={lr}, z_value={z_value}")
     print("=" * 60)
 
-    from transformers import AutoTokenizer
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Load Generator (for shared embedding)
-    generator = UPVSubNet(bit_number=bit_number, window_size=window_size)
-    generator.load_state_dict(torch.load(generator_path, map_location=device))
-    generator.to(device)
-    generator.eval()
-
-    # Build Detector with shared embedding
-    detector = UPVDetectorNet(bit_number=bit_number)
-    detector.set_shared_embedding(generator)
-    detector.to(device)
-
-    trainable = sum(p.numel() for p in detector.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in detector.parameters())
-    print(f"  Detector params: {total:,} total, {trainable:,} trainable")
-
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(llm_name)
-
-    # Load training data
-    texts, labels = [], []
-    with open(train_data_path) as f:
+    # Train data: random token sequences, label = z-score > z_value
+    train_data = []
+    with open(os.path.join(input_dir, 'train_data.jsonl')) as f:
         for line in f:
-            item = json.loads(line)
-            texts.append(item["Input"])
-            labels.append(item["Tag"])
+            obj = json.loads(line)
+            bins = [int_to_bin_list(n, bit_number) for n in obj['Input']]
+            label = 1 if obj['Output'] > z_value else 0
+            train_data.append((torch.tensor(bins), torch.tensor(label)))
+    print(f"  Train: {len(train_data)} samples")
 
-    print(f"  Training samples: {len(texts)} ({sum(labels)} watermarked, {len(labels) - sum(labels)} natural)")
+    # Test data: real text
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(llm_name, use_fast=False)
+    test_data = []
+    with open(os.path.join(input_dir, 'test_data.jsonl')) as f:
+        for line in f:
+            obj = json.loads(line)
+            toks = tokenizer(obj['Input'], return_tensors="pt", add_special_tokens=True)
+            bins = [int_to_bin_list(int(n), bit_number) for n in toks["input_ids"].squeeze()]
+            test_data.append((torch.tensor(bins), torch.tensor(obj['Tag']),
+                              torch.tensor(obj['Z-score'])))
+    print(f"  Test: {len(test_data)} samples")
 
-    # Convert to binary sequences
-    max_val = 2 ** bit_number
-    max_seq_len = 200
+    train_loader = DataLoader(train_data, batch_size=64, shuffle=True, collate_fn=train_collate)
+    test_loader = DataLoader(test_data, batch_size=32, collate_fn=test_collate)
 
-    binary_seqs = []
-    for text in texts:
-        token_ids = tokenizer(text, add_special_tokens=False)["input_ids"][:max_seq_len]
-        binary = []
-        for tid in token_ids:
-            binary.append(int_to_bin(tid % max_val, bit_number))
-        # Pad
-        while len(binary) < max_seq_len:
-            binary.append([0] * bit_number)
-        binary_seqs.append(binary[:max_seq_len])
+    # Model
+    model = TransformerClassifier(bit_number, b_layers, 64, 128).to(device)
 
-    X = torch.tensor(binary_seqs, dtype=torch.float32)
-    y = torch.tensor(labels, dtype=torch.float32).unsqueeze(-1)
+    # Load shared embedding
+    pretrained = torch.load(model_file, map_location=device)
+    model_dict = model.binary_classifier.state_dict()
+    pretrained = {k: v for k, v in pretrained.items() if k in model_dict}
+    model_dict.update(pretrained)
+    model.binary_classifier.load_state_dict(model_dict, strict=True)
+    for p in model.binary_classifier.parameters():
+        p.requires_grad = False
+    print(f"  ✓ Shared embedding loaded & FROZEN")
+    print(f"  Trainable: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-    dataset = torch.utils.data.TensorDataset(X, y)
+    optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
+    loss_fn = nn.BCELoss()
 
-    # Split
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_ds, val_ds = torch.utils.data.random_split(dataset, [train_size, val_size])
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-
-    # Training
-    criterion = nn.BCELoss()
-    optimizer = optim.Adam(
-        [p for p in detector.parameters() if p.requires_grad],
-        lr=lr,
-    )
-
-    best_f1 = 0.0
     for epoch in range(epochs):
-        # Train
-        detector.train()
-        train_loss = 0
-        n_batches = 0
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-
-            pred = detector(X_batch)
-            loss = criterion(pred, y_batch)
-
+        model.train()
+        losses, correct, total_n = [], 0, 0
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.float().to(device), targets.to(device)
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            outputs = model(inputs).reshape([-1])
+            loss = loss_fn(outputs, targets.float())
+            loss.backward(); optimizer.step()
+            losses.append(loss.item())
+            correct += ((outputs > 0.5).float() == targets).sum().item()
+            total_n += targets.size(0)
 
-            train_loss += loss.item()
-            n_batches += 1
-
-        # Validate
-        detector.eval()
-        all_preds, all_labels = [], []
+        model.eval()
+        tp, fp, fn, tn = 0, 0, 0, 0
         with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch = X_batch.to(device)
-                pred = detector(X_batch)
-                all_preds.extend((pred > 0.5).float().cpu().squeeze().tolist())
-                all_labels.extend(y_batch.squeeze().tolist())
+            for inputs, targets, _ in test_loader:
+                inputs, targets = inputs.float().to(device), targets.to(device)
+                pred = (model(inputs).reshape([-1]) > 0.5).int()
+                tp += (pred & targets).sum().item()
+                fp += (pred & (~targets.bool())).sum().item()
+                fn += ((~pred.bool()) & targets).sum().item()
+                tn += ((~pred.bool()) & (~targets.bool())).sum().item()
 
-        # F1 score
-        tp = sum(1 for p, l in zip(all_preds, all_labels) if p == 1 and l == 1)
-        fp = sum(1 for p, l in zip(all_preds, all_labels) if p == 1 and l == 0)
-        fn = sum(1 for p, l in zip(all_preds, all_labels) if p == 0 and l == 1)
-        precision = tp / (tp + fp + 1e-8)
-        recall = tp / (tp + fn + 1e-8)
-        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+        acc = 100 * (tp + tn) / max(tp + fp + fn + tn, 1)
+        f1 = 100 * 2 * tp / max(2 * tp + fn + fp, 1)
+        tpr = 100 * tp / max(tp + fn, 1)
+        fpr = 100 * fp / max(fp + tn, 1)
 
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"  Epoch {epoch + 1:3d}/{epochs} | Loss: {train_loss / n_batches:.4f} | "
-                  f"F1: {f1:.4f} | P: {precision:.4f} | R: {recall:.4f}")
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"  Epoch {epoch+1:3d}/{epochs} | Loss: {sum(losses)/len(losses):.4f} | "
+                  f"Acc: {acc:.1f}% | F1: {f1:.1f}% | TPR: {tpr:.1f}% | FPR: {fpr:.1f}%")
 
-        if f1 > best_f1:
-            best_f1 = f1
-            save_path = os.path.join(output_dir, "detector_model_b16_p1_z4.pt")
-            torch.save(detector.state_dict(), save_path)
-
-    save_path = os.path.join(output_dir, "detector_model_b16_p1_z4.pt")
-    torch.save(detector.state_dict(), save_path)
-    print(f"  ✓ Detector saved to {save_path}")
-    print(f"  ✓ Best F1: {best_f1:.4f}")
-
-    return detector
+    os.makedirs(output_model_dir, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(output_model_dir, "detector_model.pt"))
+    torch.save(model.binary_classifier.state_dict(), os.path.join(output_model_dir, "detector_subnet.pt"))
+    print(f"  ✓ Detector saved → {output_model_dir}")
 
 
 # ============================================================
@@ -766,95 +571,93 @@ def train_detector(
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Train UPV Generator + Detector")
-    parser.add_argument("--step", nargs="+", type=int, default=[1, 2, 3, 4],
-                        help="Which steps to run (1-4)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--step", nargs="+", type=int, default=[1, 2, 3, 4])
     parser.add_argument("--llm", type=str, default="facebook/opt-1.3b")
     parser.add_argument("--bit_number", type=int, default=16)
     parser.add_argument("--window_size", type=int, default=1)
+    parser.add_argument("--layers", type=int, default=5)
     parser.add_argument("--delta", type=float, default=2.0)
-    parser.add_argument("--num_samples", type=int, default=500,
-                        help="Number of watermarked text samples to generate")
-    parser.add_argument("--data_path", type=str, default="data/processed_c4.json",
-                        help="Path to your processed_c4.json with prompts")
+    parser.add_argument("--z_value", type=float, default=4.0)
+    parser.add_argument("--num_train_samples", type=int, default=10000)
+    parser.add_argument("--num_test_samples", type=int, default=500)
+    parser.add_argument("--data_path", type=str, default="data/processed_c4.jsonl")
+    parser.add_argument("--use_pretrained", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output_dir", type=str, default=os.path.join(PROJECT_ROOT, "upv"))
-
     args = parser.parse_args()
+
+    if args.data_path and not os.path.isabs(args.data_path):
+        args.data_path = os.path.join(PROJECT_ROOT, args.data_path)
 
     model_dir = os.path.join(args.output_dir, "model")
     data_dir = os.path.join(args.output_dir, "data")
     train_data_dir = os.path.join(args.output_dir, "train_data")
-
-    os.makedirs(model_dir, exist_ok=True)
-    os.makedirs(data_dir, exist_ok=True)
-    os.makedirs(train_data_dir, exist_ok=True)
+    for d in [model_dir, data_dir, train_data_dir]:
+        os.makedirs(d, exist_ok=True)
 
     print("=" * 60)
-    print("UPV Training Pipeline")
+    print("UPV Training Pipeline (ORIGINAL architecture)")
     print(f"  Steps: {args.step}")
-    print(f"  LLM: {args.llm}")
+    print(f"  bit={args.bit_number}, window={args.window_size}, layers={args.layers}")
     print(f"  Device: {args.device}")
-    print(f"  Output: {args.output_dir}")
+    if args.data_path:
+        print(f"  Data: {args.data_path} (exists: {os.path.exists(args.data_path)})")
     print("=" * 60)
 
-    train_data_file = os.path.join(train_data_dir, "train_generator_data.jsonl")
-    generator_path = os.path.join(model_dir, "generator_model_b16_p1.pt")
-    wm_train_path = os.path.join(data_dir, "train_data.jsonl")
+    # Handle pre-trained
+    if args.use_pretrained:
+        repo = os.path.join(PROJECT_ROOT, "unforgeable_watermark")
+        paths = [
+            os.path.join(repo, f"experiments/robustness/generator_model/opt-1.3b/window_size_{args.window_size}"),
+            os.path.join(repo, "experiments/main_experiments/generator_model"),
+        ]
+        found = False
+        for p in paths:
+            if os.path.exists(os.path.join(p, "combine_model.pt")):
+                import shutil
+                shutil.copy(os.path.join(p, "combine_model.pt"), os.path.join(model_dir, "combine_model.pt"))
+                shutil.copy(os.path.join(p, "sub_net.pt"), os.path.join(model_dir, "sub_net.pt"))
+                print(f"  ✓ Pre-trained weights from {p}")
+                found = True; break
+        if not found:
+            print("  ⚠ Not found. Run: git clone https://github.com/THU-BPM/unforgeable_watermark.git")
+            return
+        args.step = [s for s in args.step if s >= 3]
 
     t0 = time.time()
+    gen_data = os.path.join(train_data_dir, "train_generator_data.jsonl")
 
     if 1 in args.step:
-        generate_training_data(
-            bit_number=args.bit_number,
-            window_size=args.window_size,
-            sample_number=2000,
-            output_file=train_data_file,
-        )
+        generate_generator_data(args.bit_number, 2000, gen_data, args.window_size)
 
     if 2 in args.step:
-        train_generator(
-            data_file=train_data_file,
-            bit_number=args.bit_number,
-            window_size=args.window_size,
-            output_dir=model_dir,
-            device=args.device,
-        )
+        train_generator(gen_data, args.bit_number, model_dir, args.window_size,
+                        args.layers, epochs=300, device=args.device)
 
     if 3 in args.step:
-        wm_train_path, _ = generate_watermarked_data(
-            generator_path=generator_path,
-            llm_name=args.llm,
-            bit_number=args.bit_number,
-            window_size=args.window_size,
-            delta=args.delta,
-            num_samples=args.num_samples,
-            output_dir=data_dir,
-            data_path=args.data_path,
-            device=args.device,
-        )
+        engine = WatermarkEngine(args.bit_number, args.window_size, args.layers,
+                                 args.delta, model_dir, args.device)
+        print("=" * 60)
+        print("STEP 3a: Detector Training Data (random token sequences)")
+        print("=" * 60)
+        engine.generate_train_data(args.num_train_samples, data_dir)
+
+        print("=" * 60)
+        print("STEP 3b: Test Data (watermarked + natural text)")
+        print("=" * 60)
+        engine.generate_test_data(args.llm, data_dir, args.data_path,
+                                  num_samples=args.num_test_samples)
 
     if 4 in args.step:
-        train_detector(
-            generator_path=generator_path,
-            train_data_path=wm_train_path,
-            llm_name=args.llm,
-            bit_number=args.bit_number,
-            window_size=args.window_size,
-            output_dir=model_dir,
-            device=args.device,
-        )
+        train_detector(args.bit_number, data_dir, os.path.join(model_dir, "sub_net.pt"),
+                       model_dir, args.layers, args.z_value, args.llm,
+                       epochs=80, lr=0.0005, device=args.device)
 
-    elapsed = time.time() - t0
-    print(f"\n{'=' * 60}")
-    print(f"Done! Total time: {elapsed / 60:.1f} minutes")
-    print(f"{'=' * 60}")
-    print(f"\nModel files:")
-    for f in os.listdir(model_dir):
-        fpath = os.path.join(model_dir, f)
-        size = os.path.getsize(fpath) / 1024
-        print(f"  {f} ({size:.1f} KB)")
-
+    print(f"\nDone! {(time.time()-t0)/60:.1f} minutes")
+    print("Model files:")
+    for f in sorted(os.listdir(model_dir)):
+        print(f"  {f} ({os.path.getsize(os.path.join(model_dir,f))/1024:.1f} KB)")
 
 if __name__ == "__main__":
     main()
