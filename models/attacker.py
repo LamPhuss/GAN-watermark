@@ -41,7 +41,14 @@ class LoRALinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         original_out = self.original_linear(x)
-        lora_out = self.lora_dropout(x) @ self.lora_A.T @ self.lora_B.T * self.scaling
+
+        # FIX: Cast LoRA weights to match input dtype (e.g. float16)
+        # This is needed because model may be loaded in float16 but
+        # LoRA params are initialized in float32
+        lora_A = self.lora_A.to(x.dtype)
+        lora_B = self.lora_B.to(x.dtype)
+
+        lora_out = self.lora_dropout(x) @ lora_A.T @ lora_B.T * self.scaling
         return original_out + lora_out
 
 
