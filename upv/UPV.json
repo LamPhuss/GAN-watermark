@@ -9,7 +9,7 @@
     "bit_number": 16,
     "sigma": 0.01,
     "default_top_k": 20,
-    "generator_model_name": "upv/model/generator_model_b16_w3.pt",
-    "detector_model_name": "upv/model/detector_model_b16_w3_z4.pt",
+    "generator_model_name": "upv/model/combine_model.pt",
+    "detector_model_name": "upv/model/detector_model.pt",
     "detect_mode": "network"
 }
