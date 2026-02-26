@@ -1,7 +1,7 @@
 # ============================================================
 # helpers.py
 # Description: Utility functions for watermark GAN
-#   Updated with Monte Carlo Search config fields.
+#   FIX 5: Added window_size, layers, pretrain_data_mode fields.
 # ============================================================
 
 import os
@@ -23,16 +23,18 @@ class GANConfig:
     upv_config_path: str
     upv_generator_weights: str
     upv_detector_weights: str
-    
+
     # Watermark
     gamma: float
     delta: float
     z_threshold: float
     prefix_length: int
+    window_size: int            # FIX 5: NEW
+    layers: int                 # FIX 5: NEW (b_layers for SubNet)
     bit_number: int
     sigma: float
     default_top_k: int
-    
+
     # Discriminator (UPV Detector)
     disc_bit_number: int
     disc_freeze_embedding: bool
@@ -40,7 +42,8 @@ class GANConfig:
     disc_pretrain_lr: float
     disc_pretrain_batch_size: int
     disc_pretrain_num_samples: int
-    
+    disc_pretrain_data_mode: str  # FIX 3: "random_tokens" or "llm_text"
+
     # Attacker
     att_lora_r: int
     att_lora_alpha: int
@@ -54,13 +57,13 @@ class GANConfig:
     att_learning_mode: str
     att_learning_num_queries: int
     att_prevctx_width: int
-    
+
     # Monte Carlo Search
     mc_num_chunks: int
     mc_num_rollouts: int
     mc_batch_size: int
     mc_rollout_policy: str
-    
+
     # Adversarial
     adv_num_epochs: int
     adv_max_gen_length: int
@@ -75,7 +78,7 @@ class GANConfig:
     adv_eval_every: int
     adv_checkpoint_every: int
     adv_checkpoint_dir: str
-    
+
     # Data
     dataset_path: str
     max_prompt_length: int
@@ -86,7 +89,7 @@ def load_config(config_path: str) -> GANConfig:
     """Load and parse the YAML config file into GANConfig."""
     with open(config_path, 'r') as f:
         cfg = yaml.safe_load(f)
-    
+
     return GANConfig(
         # Model
         llm_name=cfg['model']['llm_name'],
@@ -94,24 +97,27 @@ def load_config(config_path: str) -> GANConfig:
         upv_config_path=cfg['model']['upv_config_path'],
         upv_generator_weights=cfg['model']['upv_generator_weights'],
         upv_detector_weights=cfg['model']['upv_detector_weights'],
-        
+
         # Watermark
         gamma=cfg['watermark']['gamma'],
         delta=cfg['watermark']['delta'],
         z_threshold=cfg['watermark']['z_threshold'],
         prefix_length=cfg['watermark']['prefix_length'],
+        window_size=cfg['watermark']['window_size'],          # FIX 5
+        layers=cfg['watermark']['layers'],                    # FIX 5
         bit_number=cfg['watermark']['bit_number'],
         sigma=cfg['watermark']['sigma'],
         default_top_k=cfg['watermark']['default_top_k'],
-        
-        # Discriminator (UPV Detector)
+
+        # Discriminator
         disc_bit_number=cfg['discriminator']['bit_number'],
         disc_freeze_embedding=cfg['discriminator']['freeze_embedding'],
         disc_pretrain_epochs=cfg['discriminator']['pretrain_epochs'],
         disc_pretrain_lr=cfg['discriminator']['pretrain_lr'],
         disc_pretrain_batch_size=cfg['discriminator']['pretrain_batch_size'],
         disc_pretrain_num_samples=cfg['discriminator']['pretrain_num_samples'],
-        
+        disc_pretrain_data_mode=cfg['discriminator'].get('pretrain_data_mode', 'random_tokens'),
+
         # Attacker
         att_lora_r=cfg['attacker']['lora_r'],
         att_lora_alpha=cfg['attacker']['lora_alpha'],
@@ -125,13 +131,13 @@ def load_config(config_path: str) -> GANConfig:
         att_learning_mode=cfg['attacker']['learning_mode'],
         att_learning_num_queries=cfg['attacker']['learning_num_queries'],
         att_prevctx_width=cfg['attacker']['prevctx_width'],
-        
+
         # Monte Carlo Search
         mc_num_chunks=cfg['monte_carlo']['num_chunks'],
         mc_num_rollouts=cfg['monte_carlo']['num_rollouts'],
         mc_batch_size=cfg['monte_carlo']['batch_size'],
         mc_rollout_policy=cfg['monte_carlo']['rollout_policy'],
-        
+
         # Adversarial
         adv_num_epochs=cfg['adversarial']['num_epochs'],
         adv_max_gen_length=cfg['adversarial']['max_gen_length'],
@@ -146,7 +152,7 @@ def load_config(config_path: str) -> GANConfig:
         adv_eval_every=cfg['adversarial']['eval_every'],
         adv_checkpoint_every=cfg['adversarial']['checkpoint_every'],
         adv_checkpoint_dir=cfg['adversarial']['checkpoint_dir'],
-        
+
         # Data
         dataset_path=cfg['data']['dataset_path'],
         max_prompt_length=cfg['data']['max_prompt_length'],
@@ -155,6 +161,7 @@ def load_config(config_path: str) -> GANConfig:
 
 
 def set_seed(seed: int = 42) -> None:
+    """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -162,30 +169,41 @@ def set_seed(seed: int = 42) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def log_metrics(metrics: Dict[str, float], step: int) -> None:
+    """Print metrics in a formatted way."""
+    parts = [f"[Step {step:04d}]"]
+    for key, value in metrics.items():
+        parts.append(f"{key}: {value:.4f}")
+    print(" | ".join(parts))
+
+
 def ensure_dir(path: str) -> None:
+    """Create directory if it doesn't exist."""
     os.makedirs(path, exist_ok=True)
 
 
-def log_metrics(metrics: Dict[str, float], epoch: int, log_file: Optional[str] = None) -> None:
-    msg = f"[Epoch {epoch:04d}] " + " | ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
-    print(msg)
-    if log_file:
-        with open(log_file, 'a') as f:
-            f.write(msg + "\n")
+def compute_ppl_from_logprobs(log_probs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Compute perplexity from log probabilities."""
+    masked_log_probs = log_probs * mask
+    counts = mask.sum(dim=-1).clamp(min=1)
+    avg_nll = -masked_log_probs.sum(dim=-1) / counts
+    return torch.exp(avg_nll)
 
 
-def compute_ppl_from_logprobs(log_probs: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-    total_log_prob = log_probs.sum(dim=-1)
-    avg_log_prob = total_log_prob / lengths.float()
-    return torch.exp(-avg_log_prob)
+def compute_diversity_score(token_ids_list: List[List[int]]) -> float:
+    """
+    Compute diversity score based on unique token ratio.
+    Low diversity suggests mode collapse.
+    """
+    if not token_ids_list:
+        return 0.0
 
-
-def compute_diversity_score(token_ids_batch: list) -> float:
     all_tokens = []
-    for seq in token_ids_batch:
-        if isinstance(seq, torch.Tensor):
-            seq = seq.tolist()
-        all_tokens.extend(seq)
+    for ids in token_ids_list:
+        all_tokens.extend(ids)
+
     if len(all_tokens) == 0:
         return 0.0
-    return len(set(all_tokens)) / len(all_tokens)
+
+    unique_ratio = len(set(all_tokens)) / len(all_tokens)
+    return unique_ratio
