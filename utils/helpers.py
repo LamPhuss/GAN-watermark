@@ -78,7 +78,8 @@ class GANConfig:
     adv_eval_every: int
     adv_checkpoint_every: int
     adv_checkpoint_dir: str
-
+    adv_d_label_smoothing: float    # Label smoothing for D (real target = 1 - smooth)
+    adv_diversity_reward: float     # Bonus weight for diverse generation
     # Data
     dataset_path: str
     max_prompt_length: int
@@ -152,6 +153,8 @@ def load_config(config_path: str) -> GANConfig:
         adv_eval_every=cfg['adversarial']['eval_every'],
         adv_checkpoint_every=cfg['adversarial']['checkpoint_every'],
         adv_checkpoint_dir=cfg['adversarial']['checkpoint_dir'],
+        adv_d_label_smoothing=cfg['adversarial'].get('d_label_smoothing', 0.0),
+        adv_diversity_reward=cfg['adversarial'].get('diversity_reward_weight', 0.0),
 
         # Data
         dataset_path=cfg['data']['dataset_path'],

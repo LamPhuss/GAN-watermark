@@ -332,7 +332,8 @@ class WatermarkLearner:
         for toks in toks_list:
             for i in range(self.prevctx_width, len(toks)):
                 ctx = tuple(toks[i - self.prevctx_width : i])
-                self.counts_wm.add(ctx, toks[i], 1)
+                EMPTY_CTX = tuple()
+                self.counts_wm.add(EMPTY_CTX, toks[i], 1)
 
     def learn_from_baseline(self, texts_base: List[str]) -> None:
         toks_list = self.tokenizer(texts_base)['input_ids']

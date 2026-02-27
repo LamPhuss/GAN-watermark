@@ -1,0 +1,11 @@
+{
+  "spoofing_rate_d": 0.19999998807907104,
+  "upv_detection_rate": 0.22,
+  "upv_avg_z_score": 0.0,
+  "upv_std_z_score": 0.0,
+  "div_ttr": 0.2019709337049572,
+  "div_vocab_coverage": 0.0403660598826221,
+  "div_bigram_diversity": 0.6529611844737895,
+  "div_unique_tokens": 2029.0,
+  "div_total_tokens": 10046.0
+}

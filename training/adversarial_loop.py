@@ -294,7 +294,17 @@ class AdversarialTrainer:
                 avg_nll = -(log_probs * gen_mask).sum(dim=-1) / gen_counts
                 ppls = torch.exp(avg_nll)
                 ppl_penalty = torch.sigmoid((ppls - 50) / 20)
-
+        diversity_w = getattr(self.config, 'adv_diversity_reward', 0.0)
+        if diversity_w > 0:
+            with torch.no_grad():
+                for b in range(generated_ids.size(0)):
+                    gen_start = prompt_lengths[b].item()
+                    gen_tokens = generated_ids[b, gen_start:].cpu().tolist()
+                    if len(gen_tokens) > 0:
+                        unique_ratio = len(set(gen_tokens)) / len(gen_tokens)
+                        # Bonus: unique_ratio=1.0 → +diversity_w, unique_ratio=0.2 → 0
+                        bonus = diversity_w * max(0, unique_ratio - 0.3) / 0.7
+                        chunk_rewards[b] += bonus
         # ── MC-REINFORCE loss ──
         self.g_optimizer.zero_grad()
 

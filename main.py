@@ -91,10 +91,37 @@ def run_adversarial(config, attacker=None, discriminator=None):
     )
 
     # ── Build static spoofer ──
+    # ── Build static spoofer (rebuild from cached data if needed) ──
     static_spoofer = getattr(attacker, '_static_spoofer', None)
     if static_spoofer is None:
-        print("[Main] Warning: No static spoofer available. MC rollout will use raw LM.")
+        print("[Main] Rebuilding static spoofer from cached learning data...")
+        wm_data_path = os.path.join(config.adv_checkpoint_dir, "learning_wm_texts.json")
+        base_data_path = os.path.join(config.adv_checkpoint_dir, "learning_base_texts.json")
 
+        if os.path.exists(wm_data_path) and os.path.exists(base_data_path):
+            import json as _json
+            from models.attacker import WatermarkLearner
+            with open(wm_data_path, 'r') as f:
+                wm_texts = _json.load(f)
+            with open(base_data_path, 'r') as f:
+                base_texts = _json.load(f)
+
+            learner = WatermarkLearner(
+                tokenizer=attacker.tokenizer,
+                prevctx_width=config.att_prevctx_width,
+            )
+            learner.learn_from_watermarked(wm_texts)
+            learner.learn_from_baseline(base_texts)
+
+            vocab_size = attacker.model.config.vocab_size
+            static_spoofer = learner.build_spoofer(vocab_size, spoofer_strength=2.0)
+            attacker._static_spoofer = static_spoofer
+            print(f"[Main] Static spoofer rebuilt. WM counts: {learner.counts_wm.total_counts():,}, "
+                  f"Base counts: {learner.counts_base.total_counts():,}")
+        else:
+            print("[Main] WARNING: No cached learning data found. MC rollout will use raw LM.")
+            print(f"[Main]   Expected: {wm_data_path}")
+            print(f"[Main]   Run pretrain_attacker first to generate learning data.")
     # ── Create trainer ──
     trainer = AdversarialTrainer(
         config=config,

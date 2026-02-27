@@ -1,5 +1,5 @@
 # ============================================================
-# Watermark GAN Configuration (MC Search + UPV Detector)
+# Watermark GAN Configuration — v2 (post-training-failure fixes)
 # ============================================================
 
 # --- Model Paths ---
@@ -22,7 +22,7 @@ watermark:
   sigma: 0.01
   default_top_k: 20
 
-# --- UPV Discriminator (Original UPV Detector) ---
+# --- UPV Discriminator ---
 discriminator:
   bit_number: 16
   freeze_embedding: true
@@ -49,8 +49,8 @@ attacker:
   pretrain_max_length: 256
 
   learning_mode: "fast"
-  learning_num_queries: 1000
-  prevctx_width: 1
+  learning_num_queries: 10000    # FIX: was 1000 → 10000
+  prevctx_width: 3              # FIX: was 1 → 3 (match UPV window_size)
 
 # --- Monte Carlo Search ---
 monte_carlo:
@@ -64,8 +64,10 @@ adversarial:
   num_epochs: 100
   max_gen_length: 200
 
-  d_steps_per_epoch: 3
+  # D/G balance — adaptive strategy
+  d_steps_per_epoch: 1          # FIX: was 3 → 1 (adaptive logic handles increase)
   d_lr: 0.0005
+  d_label_smoothing: 0.1       # FIX NEW: real labels = 0.9 instead of 1.0
 
   g_steps_per_epoch: 1
   g_lr: 0.00005
@@ -79,6 +81,9 @@ adversarial:
   eval_every: 5
   checkpoint_every: 10
   checkpoint_dir: "checkpoints"
+
+  # Anti-mode-collapse
+  diversity_reward_weight: 0.05   # FIX NEW: bonus reward for diverse text
 
 # --- Evaluation ---
 evaluation:
