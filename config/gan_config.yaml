@@ -45,7 +45,7 @@ attacker:
   pretrain_epochs: 3
   pretrain_lr: 0.0002
   pretrain_batch_size: 4
-  pretrain_num_samples: 5000
+  pretrain_num_samples: 10000
   pretrain_max_length: 256
 
   learning_mode: "fast"
