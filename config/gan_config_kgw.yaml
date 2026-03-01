@@ -1,0 +1,86 @@
+# ============================================================
+# Watermark GAN Configuration — KGW-SelfHash version
+# ============================================================
+
+model:
+  llm_name: "facebook/opt-1.3b"
+  device: "cuda"
+
+# --- KGW Watermark Parameters ---
+watermark:
+  scheme: "kgw_selfhash"
+  gamma: 0.25              # green list fraction
+  delta: 2.0               # logit bias for green tokens
+  context_width: 4         # h=3 + self-seeding = 4
+  hash_key: 15485863       # PRF secret key ξ
+  z_threshold: 4.0         # detection threshold
+
+# --- KGW Discriminator (z-score based) ---
+discriminator:
+  mode: "zscore"           # "zscore" (non-trainable) or "lstm" (trainable)
+  z_center: 2.0            # reward sigmoid center
+  temperature: 2.0         # reward sigmoid temperature
+
+# --- Attacker (LLM with LoRA) ---
+attacker:
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  lora_target_modules:
+    - "q_proj"
+    - "v_proj"
+
+  pretrain_epochs: 3
+  pretrain_lr: 0.0002
+  pretrain_batch_size: 4
+  pretrain_num_samples: 5000
+  pretrain_max_length: 256
+
+  learning_mode: "fast"
+  learning_num_queries: 10000
+  prevctx_width: 3         # KGW selfhash h=3
+
+# --- Monte Carlo Search ---
+monte_carlo:
+  num_chunks: 4
+  num_rollouts: 3
+  batch_size: 4
+  rollout_policy: "static_spoofer"
+
+# --- Adversarial Training ---
+adversarial:
+  num_epochs: 200
+  max_gen_length: 200
+
+  # D is z-score based (no training needed)
+  d_steps_per_epoch: 0     # D not trained — z-score is deterministic
+  d_lr: 0.0
+
+  # G update
+  g_steps_per_epoch: 1
+  g_lr: 0.00005
+
+  # Reward
+  lambda_reward: 1.0
+  lambda_ppl: 0.1
+  reward_baseline: 0.5
+
+  temperature: 1.0
+
+  eval_every: 5
+  checkpoint_every: 10
+  checkpoint_dir: "checkpoints"
+
+# --- Evaluation ---
+evaluation:
+  track_spoofing_rate: true
+  track_diversity_score: true
+  track_ppl: true
+  track_z_score: true
+  num_eval_samples: 50
+
+# --- Data ---
+data:
+  dataset_path: "data/processed_c4.jsonl"
+  max_prompt_length: 128
+  num_prompts: 5000
