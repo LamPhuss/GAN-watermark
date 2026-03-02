@@ -93,39 +93,114 @@ class StaticSpoofer:
         self.clip_at = clip_at
         self.min_wm_count = min_wm_count
 
-    def get_boosts(self, ctx: tuple, device: str = "cpu") -> torch.Tensor:
-        c_base = self.counts_base.get(ctx)
-        c_wm = self.counts_wm.get(ctx)
+    def get_boosts(self, ctx, device="cpu"):
+        """
+        Multi-component scoring following watermark-stealing paper (Eq. 3-4).
 
-        base_tensor = torch.zeros(self.vocab_size, device=device)
-        wm_tensor = torch.zeros(self.vocab_size, device=device)
-        for tok, cnt in c_base.items():
-            if tok < self.vocab_size:
-                base_tensor[tok] = cnt
-        for tok, cnt in c_wm.items():
-            if tok < self.vocab_size:
-                wm_tensor[tok] = cnt
+        Combines:
+        - Full ordered context s(T, {A,B,C}) with weight w_full
+        - Partial unordered contexts s(T, {A}), s(T, {B}), ... with weight w_partial
+        - Empty context s(T, {}) with weight w_empty
 
-        mass_base = base_tensor / (base_tensor.sum() + 1e-6)
-        mass_wm = wm_tensor / (wm_tensor.sum() + 1e-6)
+        This is the key innovation that makes stealing work with large context widths.
+        """
+        import torch
 
-        enough_data_mask = wm_tensor >= self.min_wm_count
-        base_zero_mask = base_tensor == 0
+        w_full = 2.0       # weight for full context (strongest signal)
+        w_partial = 1.0    # weight for partial contexts
+        w_empty = 0.5      # weight for empty/context-independent
 
-        ratios = torch.zeros_like(mass_wm)
-        core_mask = enough_data_mask & ~base_zero_mask
-        ratios[core_mask] = mass_wm[core_mask] / mass_base[core_mask]
-        ratios[enough_data_mask & base_zero_mask] = max(1, ratios.max().item()) + 1e-3
+        combined = torch.zeros(self.vocab_size, device=device)
+        total_weight = 0.0
 
-        ratios[ratios < 1] = 0
-        ratios[ratios > self.clip_at] = self.clip_at
-        ratios /= self.clip_at + 1e-8
+        # 1. Full ordered context: s(T, {A,B,C})
+        score_full = self._compute_score_for_context(ctx, ordered=True, device=device)
+        if score_full is not None:
+            combined += w_full * score_full
+            total_weight += w_full
 
-        if ratios.max() > 0:
-            ratios = ratios / (ratios.max() + 1e-8)
+        # 2. Partial contexts (unordered): s(T, {A}), s(T, {B}), s(T, {C})
+        # Also try pairs: s(T, {A,B}), s(T, {A,C}), s(T, {B,C})
+        if len(ctx) > 0:
+            ctx_tokens = [t for t in ctx if t >= 0]  # filter wildcards
+            # Singles
+            for tok in ctx_tokens:
+                partial_ctx = tuple(sorted([tok]))
+                score_p = self._compute_score_for_context(partial_ctx, ordered=False, device=device)
+                if score_p is not None:
+                    combined += w_partial * score_p
+                    total_weight += w_partial
+            # Pairs (if prevctx_width >= 2)
+            if len(ctx_tokens) >= 2:
+                from itertools import combinations
+                for pair in combinations(ctx_tokens, 2):
+                    partial_ctx = tuple(sorted(pair))
+                    score_p = self._compute_score_for_context(partial_ctx, ordered=False, device=device)
+                    if score_p is not None:
+                        combined += w_partial * 0.5 * score_p  # pairs get half weight
+                        total_weight += w_partial * 0.5
 
-        return ratios
+        # 3. Empty context: s(T, {})
+        score_empty = self._compute_score_for_context(tuple(), ordered=False, device=device)
+        if score_empty is not None:
+            combined += w_empty * score_empty
+            total_weight += w_empty
 
+        if total_weight > 0:
+            combined /= total_weight
+
+        return combined
+
+
+def _compute_score_for_context(self, ctx, ordered, device):
+    """Compute score vector for a single context. Returns None if no data."""
+    import torch
+
+    try:
+        c_base = self.counts_base.get(ctx, ordered=ordered)
+        c_wm = self.counts_wm.get(ctx, ordered=ordered)
+    except (ValueError, KeyError):
+        return None
+
+    if not c_wm:
+        return None
+
+    base_tensor = torch.zeros(self.vocab_size, device=device)
+    wm_tensor = torch.zeros(self.vocab_size, device=device)
+    for tok, cnt in c_base.items():
+        if tok < self.vocab_size:
+            base_tensor[tok] = cnt
+    for tok, cnt in c_wm.items():
+        if tok < self.vocab_size:
+            wm_tensor[tok] = cnt
+
+    mass_base = base_tensor / (base_tensor.sum() + 1e-6)
+    mass_wm = wm_tensor / (wm_tensor.sum() + 1e-6)
+
+    # Score: ratio of WM mass to base mass, clipped to [0, clip_at]
+    enough_data = wm_tensor >= self.min_wm_count
+    base_nonzero = base_tensor > 0
+
+    scores = torch.zeros_like(mass_wm)
+    valid = enough_data & base_nonzero
+    scores[valid] = mass_wm[valid] / mass_base[valid]
+
+    # Tokens only in WM (not in base) → likely green
+    only_wm = enough_data & ~base_nonzero
+    if scores[valid].numel() > 0 and scores[valid].max() > 0:
+        scores[only_wm] = scores[valid].max() + 1e-3
+    else:
+        scores[only_wm] = 1.0
+
+    # Threshold: ratio < 1 means token appears LESS in WM → likely red
+    scores[scores < 1.0] = 0.0
+
+    # Clip and normalize to [0, 1]
+    scores = scores.clamp(0, self.clip_at)
+    if scores.max() > 0:
+        scores /= scores.max()
+
+    return scores
 
 def _load_model_with_flash_attn(model_name: str, device: str) -> AutoModelForCausalLM:
     """
@@ -332,8 +407,7 @@ class WatermarkLearner:
         for toks in toks_list:
             for i in range(self.prevctx_width, len(toks)):
                 ctx = tuple(toks[i - self.prevctx_width : i])
-                EMPTY_CTX = tuple()
-                self.counts_wm.add(EMPTY_CTX, toks[i], 1)
+                self.counts_wm.add(ctx, toks[i], 1)
 
     def learn_from_baseline(self, texts_base: List[str]) -> None:
         toks_list = self.tokenizer(texts_base)['input_ids']
