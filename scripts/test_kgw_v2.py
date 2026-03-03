@@ -41,24 +41,47 @@ with open(DATASET_PATH, 'r') as f:
 
 print(f"Loaded {len(PROMPTS)} prompts from {DATASET_PATH}")
 
-NUM_TEXTS = min(1000, len(PROMPTS))  # use up to 1000
+NUM_TEXTS = min(10000, len(PROMPTS))
 BATCH_SIZE = 10
 NUM_BATCHES = NUM_TEXTS // BATCH_SIZE
-wm_all, base_all = [], []
 
-t0 = time.time()
-print(f"\nCollecting {NUM_TEXTS} WM + {NUM_TEXTS} base texts...")
-for i in range(NUM_BATCHES):
-    batch = PROMPTS[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
-    wm_t, _ = oracle.generate_watermarked(batch)
-    nat_t, _ = oracle.generate_unwatermarked(batch)
-    wm_all.extend(wm_t)
-    base_all.extend(nat_t)
-    if (i + 1) % 5 == 0:
-        elapsed = time.time() - t0
-        print(f"  {len(wm_all)}/{NUM_TEXTS} texts | {elapsed:.0f}s elapsed")
+# ── Cache paths ──
+CACHE_DIR = "checkpoints"
+os.makedirs(CACHE_DIR, exist_ok=True)
+WM_CACHE = os.path.join(CACHE_DIR, "kgw_learning_wm_texts.json")
+BASE_CACHE = os.path.join(CACHE_DIR, "kgw_learning_base_texts.json")
 
-print(f"\nTotal: {len(wm_all)} WM + {len(base_all)} base texts in {time.time()-t0:.0f}s")
+if os.path.exists(WM_CACHE) and os.path.exists(BASE_CACHE):
+    print(f"\n📂 Loading cached data from {CACHE_DIR}/")
+    with open(WM_CACHE, 'r') as f:
+        wm_all = json.load(f)
+    with open(BASE_CACHE, 'r') as f:
+        base_all = json.load(f)
+    print(f"  Loaded {len(wm_all)} WM + {len(base_all)} base texts from cache")
+else:
+    wm_all, base_all = [], []
+    t0 = time.time()
+    print(f"\nCollecting {NUM_TEXTS} WM + {NUM_TEXTS} base texts...")
+    for i in range(NUM_BATCHES):
+        batch = PROMPTS[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
+        wm_t, _ = oracle.generate_watermarked(batch)
+        nat_t, _ = oracle.generate_unwatermarked(batch)
+        wm_all.extend(wm_t)
+        base_all.extend(nat_t)
+        if (i + 1) % 20 == 0:
+            elapsed = time.time() - t0
+            print(f"  {len(wm_all)}/{NUM_TEXTS} texts | {elapsed:.0f}s elapsed")
+
+    print(f"\nTotal: {len(wm_all)} WM + {len(base_all)} base texts in {time.time()-t0:.0f}s")
+
+    # ── Save to cache ──
+    print(f"\n💾 Saving to {CACHE_DIR}/ for reuse...")
+    with open(WM_CACHE, 'w') as f:
+        json.dump(wm_all, f)
+    with open(BASE_CACHE, 'w') as f:
+        json.dump(base_all, f)
+    print(f"  Saved: {WM_CACHE} ({os.path.getsize(WM_CACHE)/1024/1024:.1f} MB)")
+    print(f"  Saved: {BASE_CACHE} ({os.path.getsize(BASE_CACHE)/1024/1024:.1f} MB)")
 
 # ── Learn watermark patterns ──
 print("\n--- Learning Phase ---")
