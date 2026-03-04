@@ -106,16 +106,7 @@ class StaticSpoofer:
         # Cache for boosts
         self._cache = {}
 
-    def get_boosts(self, ctx: tuple, device: str = "cpu") -> torch.Tensor:
-        """
-        Multi-component scoring matching paper's SpoofedProcessor.
-        
-        ctx: ordered tuple of prevctx_width token IDs, e.g. (100, 200, 300)
-        Returns: boost vector [vocab_size] in [0, 1]
-        """
-        import torch
-        
-        # Check cache
+    def get_boosts(self, ctx, device="cpu"):
         cache_key = (ctx, device)
         if cache_key in self._cache:
             return self._cache[cache_key]
@@ -123,66 +114,55 @@ class StaticSpoofer:
         boosts = torch.zeros(self.vocab_size, device=device)
         total_w = 0.0
 
-        # ── 1) Full context {A,B,C}→D — UNORDERED (sorted) ──
+        # 1) Full context (sorted)
         ctx_sorted = tuple(sorted(ctx))
-        score_full = self._score_for_ctx(ctx_sorted, ordered=False, device=device)
+        score_full = self._score_for_ctx(ctx_sorted, device=device)
         if score_full is not None:
             boosts += self.w_abcd * score_full
             total_w += self.w_abcd
 
-        # ── 2) Partial: find T_min and add {T_min}→D ──
+        # 2) Partial: best single token
         if self.w_partials > 0 and len(ctx) > 0:
-            # Heuristic from paper Eq. 4: find token with strongest solo signal
-            # In practice, just use all singles and let weighting handle it
-            # Paper: find T_min via cosine similarity, simplified: try all
             best_partial = None
-            best_sim = -1.0
-            
+            best_norm = -1.0
             for tok in ctx:
-                solo = self._score_for_ctx((tok,), ordered=False, device=device)
+                solo = self._score_for_ctx((tok,), device=device)
                 if solo is not None:
-                    # Use the one with highest norm (most informative)
                     norm = solo.norm().item()
-                    if norm > best_sim:
-                        best_sim = norm
+                    if norm > best_norm:
+                        best_norm = norm
                         best_partial = solo
-            
             if best_partial is not None:
                 boosts += self.w_partials * best_partial
                 total_w += self.w_partials
 
-        # ── 3) Empty context {}→D — context-independent ──
+        # 3) Empty context
         if self.w_empty > 0:
-            score_empty = self._score_for_ctx(tuple(), ordered=False, device=device)
+            score_empty = self._score_for_ctx(tuple(), device=device)
             if score_empty is not None:
                 boosts += self.w_empty * score_empty
                 total_w += self.w_empty
 
-        # ── Normalize ──
         if total_w > 0:
             boosts /= total_w
 
         self._cache[cache_key] = boosts
         return boosts
 
-    def _score_for_ctx(self, ctx: tuple, ordered: bool, device: str):
+    def _score_for_ctx(self, ctx, ordered=None, device="cpu"):
         """
-        Compute score vector for a single context.
-        Score s(T, ctx) = clipped ratio of p_wm(T|ctx) / p_base(T|ctx).
-        Returns None if insufficient data.
+        Compute score vector for a context.
+        ctx is already sorted (unordered).
+        Uses simple CountStore.get(ctx) — no ordered parameter.
         """
-        import torch
 
-        try:
-            c_base = self.counts_base.get(ctx, ordered=ordered)
-            c_wm = self.counts_wm.get(ctx, ordered=ordered)
-        except (ValueError, KeyError):
-            return None
-
+        
+        c_base = self.counts_base.get(ctx)
+        c_wm = self.counts_wm.get(ctx)
+        
         if not c_wm:
             return None
 
-        # Build tensors
         base_tensor = torch.zeros(self.vocab_size, device=device)
         wm_tensor = torch.zeros(self.vocab_size, device=device)
         for tok, cnt in c_base.items():
@@ -192,13 +172,10 @@ class StaticSpoofer:
             if tok < self.vocab_size:
                 wm_tensor[tok] = cnt
 
-        # Probability masses
         mass_base = base_tensor / (base_tensor.sum() + 1e-6)
         mass_wm = wm_tensor / (wm_tensor.sum() + 1e-6)
 
-        # Min data threshold (from paper)
         if len(ctx) == 0:
-            # Empty context: use mass-based threshold
             min_thresh = max(1, round(0.00007 * base_tensor.sum().item()))
         else:
             min_thresh = self.min_wm_count
@@ -207,25 +184,20 @@ class StaticSpoofer:
         base_nonzero = base_tensor > 0
 
         scores = torch.zeros_like(mass_wm)
-
-        # Ratio for tokens with enough data in both
         valid = enough_data & base_nonzero
         scores[valid] = mass_wm[valid] / mass_base[valid]
 
-        # Tokens only in WM (not in base) → very likely green
         only_wm = enough_data & ~base_nonzero
         max_ratio = scores[valid].max().item() if valid.any() else 1.0
         scores[only_wm] = max_ratio + 1e-3
 
-        # Ratio < 1 → likely red → zero out
         scores[scores < 1.0] = 0.0
-
-        # Clip to [0, clip_at] and normalize to [0, 1]
         scores = scores.clamp(0, self.clip_at)
         if scores.max() > 0:
             scores /= scores.max()
 
         return scores
+
 
 def _load_model_with_flash_attn(model_name: str, device: str) -> AutoModelForCausalLM:
     """
@@ -432,19 +404,45 @@ class WatermarkLearner:
         self.counts_wm = CountStore(prevctx_width)
         self.counts_base = CountStore(prevctx_width)
 
-    def learn_from_watermarked(self, texts_wm: List[str]) -> None:
+    def learn_from_watermarked(self, texts_wm):
+        """
+        Learn WM patterns — stores counts for ALL context subsets (powerset).
+        Matches paper's approach of permutation-invariant context.
+        """
+        from itertools import combinations
         toks_list = self.tokenizer(texts_wm)['input_ids']
         for toks in toks_list:
             for i in range(self.prevctx_width, len(toks)):
-                ctx = tuple(toks[i - self.prevctx_width : i])
-                self.counts_wm.add(ctx, toks[i], 1)
+                ctx_tokens = toks[i - self.prevctx_width : i]
+                tok = toks[i]
+                
+                # Full context (sorted = unordered)
+                ctx_full = tuple(sorted(ctx_tokens))
+                self.counts_wm.add(ctx_full, tok, 1)
+                
+                # All partial subsets: singles, pairs, etc.
+                for size in range(len(ctx_tokens)):
+                    for subset in combinations(ctx_tokens, size):
+                        ctx_partial = tuple(sorted(subset))
+                        self.counts_wm.add(ctx_partial, tok, 1)
 
-    def learn_from_baseline(self, texts_base: List[str]) -> None:
+    def learn_from_baseline(self, texts_base):
+        """Learn baseline patterns — same powerset approach."""
+        from itertools import combinations
         toks_list = self.tokenizer(texts_base)['input_ids']
         for toks in toks_list:
             for i in range(self.prevctx_width, len(toks)):
-                ctx = tuple(toks[i - self.prevctx_width : i])
-                self.counts_base.add(ctx, toks[i], 1)
+                ctx_tokens = toks[i - self.prevctx_width : i]
+                tok = toks[i]
+                
+                ctx_full = tuple(sorted(ctx_tokens))
+                self.counts_base.add(ctx_full, tok, 1)
+                
+                for size in range(len(ctx_tokens)):
+                    for subset in combinations(ctx_tokens, size):
+                        ctx_partial = tuple(sorted(subset))
+                        self.counts_base.add(ctx_partial, tok, 1)
+
 
     def build_spoofer(self, vocab_size, spoofer_strength=7.5):
         return StaticSpoofer(

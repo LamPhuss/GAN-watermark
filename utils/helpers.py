@@ -1,14 +1,8 @@
 # ============================================================
-# helpers.py
-# Description: Utility functions for watermark GAN
-#   FIX 5: Added window_size, layers, pretrain_data_mode fields.
+# helpers.py — KGW version
 # ============================================================
 
-import os
-import json
-import yaml
-import random
-import torch
+import os, json, yaml, random, torch
 import numpy as np
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
@@ -16,33 +10,22 @@ from dataclasses import dataclass
 
 @dataclass
 class GANConfig:
-    """Parsed GAN configuration."""
+    """Parsed GAN configuration — KGW version."""
     # Model
     llm_name: str
     device: str
-    upv_config_path: str
-    upv_generator_weights: str
-    upv_detector_weights: str
 
-    # Watermark
-    gamma: float
-    delta: float
-    z_threshold: float
-    prefix_length: int
-    window_size: int            # FIX 5: NEW
-    layers: int                 # FIX 5: NEW (b_layers for SubNet)
-    bit_number: int
-    sigma: float
-    default_top_k: int
+    # KGW Watermark
+    wm_gamma: float
+    wm_delta: float
+    wm_context_width: int
+    wm_hash_key: int
+    wm_z_threshold: float
 
-    # Discriminator (UPV Detector)
-    disc_bit_number: int
-    disc_freeze_embedding: bool
-    disc_pretrain_epochs: int
-    disc_pretrain_lr: float
-    disc_pretrain_batch_size: int
-    disc_pretrain_num_samples: int
-    disc_pretrain_data_mode: str  # FIX 3: "random_tokens" or "llm_text"
+    # Discriminator (z-score based)
+    disc_mode: str
+    disc_z_center: float
+    disc_temperature: float
 
     # Attacker
     att_lora_r: int
@@ -57,6 +40,7 @@ class GANConfig:
     att_learning_mode: str
     att_learning_num_queries: int
     att_prevctx_width: int
+    att_spoofer_strength: float
 
     # Monte Carlo Search
     mc_num_chunks: int
@@ -78,8 +62,9 @@ class GANConfig:
     adv_eval_every: int
     adv_checkpoint_every: int
     adv_checkpoint_dir: str
-    adv_d_label_smoothing: float    # Label smoothing for D (real target = 1 - smooth)
-    adv_diversity_reward: float     # Bonus weight for diverse generation
+    adv_d_label_smoothing: float
+    adv_diversity_reward: float
+
     # Data
     dataset_path: str
     max_prompt_length: int
@@ -87,39 +72,23 @@ class GANConfig:
 
 
 def load_config(config_path: str) -> GANConfig:
-    """Load and parse the YAML config file into GANConfig."""
     with open(config_path, 'r') as f:
         cfg = yaml.safe_load(f)
 
     return GANConfig(
-        # Model
         llm_name=cfg['model']['llm_name'],
         device=cfg['model']['device'],
-        upv_config_path=cfg['model']['upv_config_path'],
-        upv_generator_weights=cfg['model']['upv_generator_weights'],
-        upv_detector_weights=cfg['model']['upv_detector_weights'],
 
-        # Watermark
-        gamma=cfg['watermark']['gamma'],
-        delta=cfg['watermark']['delta'],
-        z_threshold=cfg['watermark']['z_threshold'],
-        prefix_length=cfg['watermark']['prefix_length'],
-        window_size=cfg['watermark']['window_size'],          # FIX 5
-        layers=cfg['watermark']['layers'],                    # FIX 5
-        bit_number=cfg['watermark']['bit_number'],
-        sigma=cfg['watermark']['sigma'],
-        default_top_k=cfg['watermark']['default_top_k'],
+        wm_gamma=cfg['watermark']['gamma'],
+        wm_delta=cfg['watermark']['delta'],
+        wm_context_width=cfg['watermark']['context_width'],
+        wm_hash_key=cfg['watermark']['hash_key'],
+        wm_z_threshold=cfg['watermark']['z_threshold'],
 
-        # Discriminator
-        disc_bit_number=cfg['discriminator']['bit_number'],
-        disc_freeze_embedding=cfg['discriminator']['freeze_embedding'],
-        disc_pretrain_epochs=cfg['discriminator']['pretrain_epochs'],
-        disc_pretrain_lr=cfg['discriminator']['pretrain_lr'],
-        disc_pretrain_batch_size=cfg['discriminator']['pretrain_batch_size'],
-        disc_pretrain_num_samples=cfg['discriminator']['pretrain_num_samples'],
-        disc_pretrain_data_mode=cfg['discriminator'].get('pretrain_data_mode', 'random_tokens'),
+        disc_mode=cfg['discriminator']['mode'],
+        disc_z_center=cfg['discriminator']['z_center'],
+        disc_temperature=cfg['discriminator']['temperature'],
 
-        # Attacker
         att_lora_r=cfg['attacker']['lora_r'],
         att_lora_alpha=cfg['attacker']['lora_alpha'],
         att_lora_dropout=cfg['attacker']['lora_dropout'],
@@ -132,14 +101,13 @@ def load_config(config_path: str) -> GANConfig:
         att_learning_mode=cfg['attacker']['learning_mode'],
         att_learning_num_queries=cfg['attacker']['learning_num_queries'],
         att_prevctx_width=cfg['attacker']['prevctx_width'],
+        att_spoofer_strength=cfg['attacker'].get('spoofer_strength', 7.5),
 
-        # Monte Carlo Search
         mc_num_chunks=cfg['monte_carlo']['num_chunks'],
         mc_num_rollouts=cfg['monte_carlo']['num_rollouts'],
         mc_batch_size=cfg['monte_carlo']['batch_size'],
         mc_rollout_policy=cfg['monte_carlo']['rollout_policy'],
 
-        # Adversarial
         adv_num_epochs=cfg['adversarial']['num_epochs'],
         adv_max_gen_length=cfg['adversarial']['max_gen_length'],
         adv_d_steps=cfg['adversarial']['d_steps_per_epoch'],
@@ -154,17 +122,15 @@ def load_config(config_path: str) -> GANConfig:
         adv_checkpoint_every=cfg['adversarial']['checkpoint_every'],
         adv_checkpoint_dir=cfg['adversarial']['checkpoint_dir'],
         adv_d_label_smoothing=cfg['adversarial'].get('d_label_smoothing', 0.0),
-        adv_diversity_reward=cfg['adversarial'].get('diversity_reward_weight', 0.0),
+        adv_diversity_reward=cfg['adversarial'].get('diversity_reward_weight', 0.05),
 
-        # Data
         dataset_path=cfg['data']['dataset_path'],
         max_prompt_length=cfg['data']['max_prompt_length'],
         num_prompts=cfg['data']['num_prompts'],
     )
 
 
-def set_seed(seed: int = 42) -> None:
-    """Set random seeds for reproducibility."""
+def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -172,41 +138,30 @@ def set_seed(seed: int = 42) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def log_metrics(metrics: Dict[str, float], step: int) -> None:
-    """Print metrics in a formatted way."""
-    parts = [f"[Step {step:04d}]"]
-    for key, value in metrics.items():
-        parts.append(f"{key}: {value:.4f}")
-    print(" | ".join(parts))
-
-
-def ensure_dir(path: str) -> None:
-    """Create directory if it doesn't exist."""
+def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 
-def compute_ppl_from_logprobs(log_probs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Compute perplexity from log probabilities."""
-    masked_log_probs = log_probs * mask
-    counts = mask.sum(dim=-1).clamp(min=1)
-    avg_nll = -masked_log_probs.sum(dim=-1) / counts
-    return torch.exp(avg_nll)
+def log_metrics(metrics: Dict[str, float], step: int):
+    parts = [f"{k}: {v:.4f}" for k, v in metrics.items()]
+    print(f"[Step {step:04d}] " + " | ".join(parts))
 
 
-def compute_diversity_score(token_ids_list: List[List[int]]) -> float:
-    """
-    Compute diversity score based on unique token ratio.
-    Low diversity suggests mode collapse.
-    """
-    if not token_ids_list:
+def compute_ppl_from_logprobs(log_probs, mask=None):
+    if mask is not None:
+        log_probs = log_probs * mask
+        avg = log_probs.sum() / mask.sum().clamp(min=1)
+    else:
+        avg = log_probs.mean()
+    return torch.exp(-avg).item()
+
+
+def compute_diversity_score(token_id_lists):
+    if not token_id_lists:
         return 0.0
-
-    all_tokens = []
-    for ids in token_ids_list:
-        all_tokens.extend(ids)
-
-    if len(all_tokens) == 0:
+    all_toks = []
+    for ids in token_id_lists:
+        all_toks.extend(ids)
+    if len(all_toks) == 0:
         return 0.0
-
-    unique_ratio = len(set(all_tokens)) / len(all_tokens)
-    return unique_ratio
+    return len(set(all_toks)) / len(all_toks)

@@ -1,20 +1,9 @@
+#!/usr/bin/env python3
 # ============================================================
-# main.py
-# Description: Main entry point for Watermark GAN
-#   with Monte Carlo Search + UPV Detector
-#
-# Usage:
-#   python main.py --stage pretrain_attacker
-#   python main.py --stage pretrain_detector
-#   python main.py --stage adversarial
-#   python main.py --stage evaluate
-#   python main.py --stage all
+# main.py — Watermark GAN (KGW-SelfHash)
 # ============================================================
 
-import os
-import sys
-import argparse
-import gc
+import os, sys, argparse, gc, json
 import torch
 
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -24,149 +13,95 @@ from utils.helpers import load_config, set_seed, ensure_dir
 
 
 def run_pretrain_attacker(config):
-    """Step 1: Pre-train Attacker via SFT on static spoofer data."""
     from training.pretrain_attacker import pretrain_attacker
     return pretrain_attacker(config)
 
 
-def run_pretrain_detector(config):
-    """Step 2: Pre-train UPV Detector on real vs natural text."""
-    from training.pretrain_detector import pretrain_detector
-    return pretrain_detector(config)
-
-
 def run_adversarial(config, attacker=None, discriminator=None):
-    """Step 3: Adversarial training with MC Search."""
     from training.adversarial_loop import AdversarialTrainer
-    from data.data_generator import UPVOracle
-    from models.upv_discriminator import UPVDiscriminatorWrapper
-    from models.attacker import AttackerLLM
+    from watermark.kgw_watermark import KGWOracle
+    from watermark.kgw_discriminator import KGWDiscriminator
+    from models.attacker import AttackerLLM, WatermarkLearner
 
     device = config.device
 
-    # ── Load Attacker ──
+    # ── Attacker ──
     if attacker is None:
-        print("[Main] Loading pre-trained Attacker...")
         attacker = AttackerLLM(
-            model_name=config.llm_name,
-            device=device,
-            lora_r=config.att_lora_r,
-            lora_alpha=config.att_lora_alpha,
+            model_name=config.llm_name, device=device,
+            lora_r=config.att_lora_r, lora_alpha=config.att_lora_alpha,
             lora_dropout=config.att_lora_dropout,
             lora_target_modules=config.att_lora_target_modules,
         )
         lora_path = os.path.join(config.adv_checkpoint_dir, "attacker_pretrained_lora.pt")
         if os.path.exists(lora_path):
-            print(f"[Main] Loading LoRA weights from {lora_path}")
             lora_state = torch.load(lora_path, map_location=device)
             for name, state in lora_state.items():
                 if name in attacker.lora_modules:
                     attacker.lora_modules[name].load_state_dict(state)
-        else:
-            print("[Main] Warning: No pre-trained LoRA weights found.")
 
-    # ── Load UPV Discriminator ──
+    # ── KGW Discriminator (non-trainable) ──
     if discriminator is None:
-        print("[Main] Loading UPV Detector as Discriminator...")
-        discriminator = UPVDiscriminatorWrapper(
-            bit_number=config.disc_bit_number,
-            detector_weights_path=config.upv_detector_weights,
-            freeze_embedding=config.disc_freeze_embedding,
+        discriminator = KGWDiscriminator(
+            vocab_size=attacker.model.config.vocab_size,
+            gamma=config.wm_gamma, delta=config.wm_delta,
+            context_width=config.wm_context_width, hash_key=config.wm_hash_key,
+            z_center=config.disc_z_center, temperature=config.disc_temperature,
             device=device,
-        ).to(device)
+        )
 
-        disc_path = os.path.join(config.adv_checkpoint_dir, "disc_pretrained_best.pt")
-        if os.path.exists(disc_path):
-            print(f"[Main] Loading pre-trained D weights from {disc_path}")
-            discriminator.load_state_dict(torch.load(disc_path, map_location=device))
-        else:
-            print("[Main] Warning: No pre-trained D found. Using original UPV weights.")
-
-    # ── Load Oracle ──
-    print("[Main] Loading UPV Oracle (frozen)...")
-    oracle = UPVOracle(
-        model_name=config.llm_name,
-        device=device,
-        upv_config_path=config.upv_config_path,
+    # ── Oracle ──
+    oracle = KGWOracle(
+        model_name=config.llm_name, device=device,
+        gamma=config.wm_gamma, delta=config.wm_delta,
+        context_width=config.wm_context_width, hash_key=config.wm_hash_key,
     )
 
-    # ── Build static spoofer ──
-    # ── Build static spoofer (rebuild from cached data if needed) ──
+    # ── Spoofer ──
     static_spoofer = getattr(attacker, '_static_spoofer', None)
     if static_spoofer is None:
-        print("[Main] Rebuilding static spoofer from cached learning data...")
-        wm_data_path = os.path.join(config.adv_checkpoint_dir, "learning_wm_texts.json")
-        base_data_path = os.path.join(config.adv_checkpoint_dir, "learning_base_texts.json")
-
-        if os.path.exists(wm_data_path) and os.path.exists(base_data_path):
-            import json as _json
-            from models.attacker import WatermarkLearner
-            with open(wm_data_path, 'r') as f:
-                wm_texts = _json.load(f)
-            with open(base_data_path, 'r') as f:
-                base_texts = _json.load(f)
-
-            learner = WatermarkLearner(
-                tokenizer=attacker.tokenizer,
-                prevctx_width=config.att_prevctx_width,
-            )
+        wm_path = os.path.join(config.adv_checkpoint_dir, "kgw_learning_wm_texts.json")
+        base_path = os.path.join(config.adv_checkpoint_dir, "kgw_learning_base_texts.json")
+        if os.path.exists(wm_path) and os.path.exists(base_path):
+            with open(wm_path) as f:
+                wm_texts = json.load(f)
+            with open(base_path) as f:
+                base_texts = json.load(f)
+            learner = WatermarkLearner(tokenizer=attacker.tokenizer, prevctx_width=config.att_prevctx_width)
             learner.learn_from_watermarked(wm_texts)
             learner.learn_from_baseline(base_texts)
-
-            vocab_size = attacker.model.config.vocab_size
-            static_spoofer = learner.build_spoofer(vocab_size, spoofer_strength=2.0)
+            static_spoofer = learner.build_spoofer(
+                attacker.model.config.vocab_size,
+                spoofer_strength=config.att_spoofer_strength,
+            )
             attacker._static_spoofer = static_spoofer
-            print(f"[Main] Static spoofer rebuilt. WM counts: {learner.counts_wm.total_counts():,}, "
-                  f"Base counts: {learner.counts_base.total_counts():,}")
-        else:
-            print("[Main] WARNING: No cached learning data found. MC rollout will use raw LM.")
-            print(f"[Main]   Expected: {wm_data_path}")
-            print(f"[Main]   Run pretrain_attacker first to generate learning data.")
-    # ── Create trainer ──
+            print(f"[Main] Spoofer rebuilt. WM: {learner.counts_wm.total_counts():,}")
+
     trainer = AdversarialTrainer(
-        config=config,
-        discriminator=discriminator,
-        attacker=attacker,
-        oracle=oracle,
-        static_spoofer=static_spoofer,
+        config=config, discriminator=discriminator,
+        attacker=attacker, oracle=oracle, static_spoofer=static_spoofer,
     )
 
-    # Resume from checkpoint if available
-    latest_checkpoint = None
+    # Resume
     if os.path.isdir(config.adv_checkpoint_dir):
-        checkpoints = [
-            f for f in os.listdir(config.adv_checkpoint_dir)
-            if f.startswith('checkpoint_epoch_')
-        ]
-        if checkpoints:
-            latest_checkpoint = os.path.join(
-                config.adv_checkpoint_dir, sorted(checkpoints)[-1]
-            )
+        cks = [f for f in os.listdir(config.adv_checkpoint_dir) if f.startswith('checkpoint_epoch_')]
+        if cks:
+            path = os.path.join(config.adv_checkpoint_dir, sorted(cks)[-1])
+            start = trainer.load_checkpoint(path)
+            print(f"[Main] Resuming from epoch {start}")
 
-    if latest_checkpoint:
-        start_epoch = trainer.load_checkpoint(latest_checkpoint)
-        print(f"[Main] Resuming from epoch {start_epoch}")
-
-    history = trainer.train()
-    return trainer, history
+    return trainer.train()
 
 
 def run_evaluate(config):
-    """Step 4: Full evaluation."""
-    from evaluation.metrics import full_evaluation
-    from data.data_generator import UPVOracle
-    from models.upv_discriminator import UPVDiscriminatorWrapper
+    from watermark.kgw_watermark import KGWOracle
     from models.attacker import AttackerLLM
-    import json
+    import numpy as np
 
     device = config.device
-
-    # Load Attacker
     attacker = AttackerLLM(
-        model_name=config.llm_name,
-        device=device,
-        lora_r=config.att_lora_r,
-        lora_alpha=config.att_lora_alpha,
+        model_name=config.llm_name, device=device,
+        lora_r=config.att_lora_r, lora_alpha=config.att_lora_alpha,
         lora_dropout=config.att_lora_dropout,
         lora_target_modules=config.att_lora_target_modules,
     )
@@ -177,93 +112,76 @@ def run_evaluate(config):
             if name in attacker.lora_modules:
                 attacker.lora_modules[name].load_state_dict(state)
 
-    # Load UPV Discriminator
-    discriminator = UPVDiscriminatorWrapper(
-        bit_number=config.disc_bit_number,
-        detector_weights_path=config.upv_detector_weights,
-        freeze_embedding=True,
-        device=device,
-    ).to(device)
-
-    disc_path = os.path.join(config.adv_checkpoint_dir, "disc_pretrained_best.pt")
-    if os.path.exists(disc_path):
-        discriminator.load_state_dict(torch.load(disc_path, map_location=device))
-
-    # Load Oracle
-    oracle = UPVOracle(
-        model_name=config.llm_name,
-        device=device,
-        upv_config_path=config.upv_config_path,
+    oracle = KGWOracle(
+        model_name=config.llm_name, device=device,
+        gamma=config.wm_gamma, delta=config.wm_delta,
+        context_width=config.wm_context_width, hash_key=config.wm_hash_key,
     )
 
-    # Load prompts
     prompts = []
     try:
-        with open(config.dataset_path, 'r') as f:
+        with open(config.dataset_path) as f:
             for line in f:
                 item = json.loads(line)
                 if 'prompt' in item:
                     prompts.append(item['prompt'])
-    except Exception:
+    except:
         prompts = ["The latest research shows that"] * 50
     prompts = prompts[:100]
 
-    results = full_evaluation(
-        discriminator=discriminator,
-        attacker=attacker,
-        oracle=oracle,
-        prompts=prompts,
-        config=config,
-    )
+    z_scores, detected = [], 0
+    for i, prompt in enumerate(prompts):
+        texts, _ = attacker.generate([prompt], max_length=200, temperature=1.0)
+        result = oracle.detect_watermark(texts[0])
+        z_scores.append(result['z_score'])
+        if result['is_watermarked']:
+            detected += 1
+        if (i + 1) % 20 == 0:
+            print(f"[Eval] {i+1}/{len(prompts)} | avg z={np.mean(z_scores):.2f}")
+
+    results = {
+        'avg_z_score': float(np.mean(z_scores)),
+        'std_z_score': float(np.std(z_scores)),
+        'spoofing_rate': detected / len(prompts),
+        'num_samples': len(prompts),
+    }
+    print(f"\n{'='*60}")
+    print(f"EVALUATION RESULTS:")
+    for k, v in results.items():
+        print(f"  {k}: {v}")
+    print(f"{'='*60}")
 
     results_path = os.path.join(config.adv_checkpoint_dir, "evaluation_results.json")
-    ensure_dir(config.adv_checkpoint_dir)
-    serializable = {k: float(v) for k, v in results.items()}
     with open(results_path, 'w') as f:
-        json.dump(serializable, f, indent=2)
-    print(f"[Main] Results saved to {results_path}")
+        json.dump(results, f, indent=2)
     return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Watermark GAN (MC Search + UPV)")
-    parser.add_argument(
-        '--stage', type=str, required=True,
-        choices=['pretrain_attacker', 'pretrain_detector', 'adversarial', 'evaluate', 'all'],
-    )
+    parser = argparse.ArgumentParser(description="Watermark GAN (KGW-SelfHash)")
+    parser.add_argument('--stage', type=str, required=True,
+                       choices=['pretrain_attacker', 'adversarial', 'evaluate', 'all'])
     parser.add_argument('--config', type=str, default='config/gan_config.yaml')
     parser.add_argument('--seed', type=int, default=42)
-
     args = parser.parse_args()
 
-    config_path = os.path.join(project_root, args.config)
-    config = load_config(config_path)
+    config = load_config(os.path.join(project_root, args.config))
     set_seed(args.seed)
     ensure_dir(config.adv_checkpoint_dir)
 
     print("=" * 60)
-    print(f"WATERMARK GAN (MC Search + UPV Detector)")
+    print(f"WATERMARK GAN (KGW-SelfHash)")
     print(f"  Stage: {args.stage}")
-    print(f"  LLM: {config.llm_name}")
-    print(f"  MC Chunks: {config.mc_num_chunks}, Rollouts: {config.mc_num_rollouts}")
-    print(f"  Device: {config.device}")
+    print(f"  KGW: γ={config.wm_gamma}, δ={config.wm_delta}, h={config.wm_context_width-1}")
     print("=" * 60)
 
     attacker = None
-    discriminator = None
-
     if args.stage in ('pretrain_attacker', 'all'):
         attacker = run_pretrain_attacker(config)
-        gc.collect()
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-    if args.stage in ('pretrain_detector', 'all'):
-        discriminator = run_pretrain_detector(config)
-        gc.collect()
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        gc.collect(); torch.cuda.empty_cache()
 
     if args.stage in ('adversarial', 'all'):
-        run_adversarial(config, attacker, discriminator)
+        run_adversarial(config, attacker)
 
     if args.stage in ('evaluate', 'all'):
         run_evaluate(config)
